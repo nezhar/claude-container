@@ -1,0 +1,6 @@
+services:
+  claude-code:
+    image: nezhar/claude-container:${CLAUDE_CONTAINER_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile

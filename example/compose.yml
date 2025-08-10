@@ -1,0 +1,12 @@
+services:
+  claude-code:
+    image: nezhar/claude-container:latest
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./workspace:/workspace
+      - ./claude-config:/claude
+    ports:
+      - "3001:3001"
+    environment:
+      CLAUDE_CONFIG_DIR: /claude
+
