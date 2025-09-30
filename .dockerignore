@@ -1,0 +1,15 @@
+# Version control
+.git
+.gitignore
+
+# Documentation
+*.md
+
+# Example files
+example/
+
+# Images
+*.jpg
+
+# Docker files
+compose.yml
