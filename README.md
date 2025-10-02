@@ -6,6 +6,13 @@ A Docker container with Claude Code pre-installed and ready to use. This contain
 
 Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com/r/nezhar/claude-container)
 
+## Compatibility Matrix
+
+| Container Version | Claude Code Version |
+|-------------------|---------------------|
+| 1.0.x             | 1.0.x               |
+| 1.1.x             | 2.0.x               |
+
 ## Quick Start
 
 ### Using Docker Compose
