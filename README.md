@@ -8,6 +8,8 @@ Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com
 
 ## Compatibility Matrix
 
+**Latest Release:** 1.1.1 (Claude Code 2.0.8)
+
 | Container Version | Claude Code Version |
 |-------------------|---------------------|
 | 1.0.x             | 1.0.x               |
@@ -37,9 +39,23 @@ This will store the credentials in `$HOME/.config/claude-container` and will be 
 
 ## How does the authentication work
 
-You will be prompted by Claude Code to authorize. If you have a Claude subscription and you choose the first login option you will receive a login link for the authorization. After following the link you will receive a token that you need to paste into your terminal and you are ready to go.
+When you run Claude Code for the first time, you'll go through the following authentication steps:
 
-![](authentication.jpg)
+1. **Choose Color Schema**: Select your preferred terminal color scheme
+
+   ![Color Schema Selection](auth1.png)
+
+2. **Select Login Method**: Choose between Subscription or Console login (this example uses Subscription)
+
+   ![Login Method Selection](auth2.png)
+
+3. **Generate Token**: Open the provided URL in your browser to generate an authentication token, then paste it into the prompt
+
+   ![Token Generation](auth3.png)
+
+4. **Success**: You're authenticated and ready to use Claude Code
+
+   ![Authentication Success](auth4.png)
 
 ## Integration with Existing Projects
 
