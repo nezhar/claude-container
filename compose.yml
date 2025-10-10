@@ -1,6 +1,12 @@
 services:
+  claude-proxy:
+    image: nezhar/claude-proxy:${CLAUDE_CONTAINER_VERSION:-latest}
+    build:
+      context: ./claude-proxy
+      dockerfile: Dockerfile
+
   claude-code:
     image: nezhar/claude-container:${CLAUDE_CONTAINER_VERSION:-latest}
     build:
-      context: .
+      context: ./claude-code
       dockerfile: Dockerfile
