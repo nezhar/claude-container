@@ -1,12 +1,20 @@
 services:
+  claude-proxy:
+    image: nezhar/claude-proxy:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./proxy-data:/data
+    environment:
+      TARGET_API_URL: https://api.anthropic.com
+
   claude-code:
     image: nezhar/claude-container:latest
-    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./workspace:/workspace
       - ./claude-config:/claude
-    ports:
-      - "3001:3001"
     environment:
       CLAUDE_CONFIG_DIR: /claude
-
+      ANTHROPIC_BASE_URL: http://claude-proxy:8080
+    depends_on:
+      - claude-proxy
