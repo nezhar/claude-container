@@ -1,10 +1,14 @@
 # Claude Container
 
-A Docker container with Claude Code pre-installed and ready to use. This container includes all necessary dependencies and provides an easy way to run Claude Code in an isolated environment.
+A Docker container with Claude Code pre-installed and ready to use.
+
+This container includes all necessary dependencies and provides an easy way to run Claude Code in an isolated environment.
+
+An optional proxy can be enabled to track all the requests made by Claude Code in a local SQLite database.
 
 ## Docker Hub
 
-Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com/r/nezhar/claude-container)
+Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com/r/nezhar/claude-container) and [nezhar/claude-proxy](https://hub.docker.com/r/nezhar/claude-proxy)
 
 ## Compatibility Matrix
 
@@ -18,10 +22,38 @@ Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com
 
 ## Quick Start
 
+### Using the Helper Script (Recommended)
+
+The easiest way to run Claude Container is using the provided bash script. Download and install it with:
+
+```bash
+# Download the script directly from GitHub
+curl -o ~/.local/bin/claude-container https://raw.githubusercontent.com/nezhar/claude-container/main/bin/claude-container
+
+# Make it executable
+chmod +x ~/.local/bin/claude-container
+
+# Run Claude Code
+claude-container
+```
+
+Make sure `~/.local/bin` is in your PATH. Alternatively, install to `/usr/local/bin`:
+
+```bash
+# Download and install system-wide (requires sudo)
+sudo curl -o /usr/local/bin/claude-container https://raw.githubusercontent.com/nezhar/claude-container/main/bin/claude-container
+sudo chmod +x /usr/local/bin/claude-container
+```
+
+The script handles all Docker configuration automatically and supports additional features like API logging. Run with `--help` to see all available options:
+
+```bash
+claude-container --help
+```
+
 ### Using Docker Compose
 
-Create a `compose.yml` file as provided in the example folder.
-
+Create a `compose.yml` file as provided in the example folder. 
 ```bash
 docker compose run claude-code claude
 ```
@@ -39,7 +71,7 @@ This will store the credentials in `$HOME/.config/claude-container` and will be 
 
 ## How does the authentication work
 
-When you run Claude Code for the first time, you'll go through the following authentication steps:
+When you run the container for the first time, you'll go through the following authentication steps:
 
 1. **Choose Color Schema**: Select your preferred terminal color scheme
 
@@ -59,7 +91,7 @@ When you run Claude Code for the first time, you'll go through the following aut
 
 ## Integration with Existing Projects
 
-To integrate Claude Code into an existing Docker Compose project, create a `compose.override.yml` file:
+To integrate Claude Container into an existing Docker Compose project, create a `compose.override.yml` file:
 
 ```yaml
 services:
@@ -92,28 +124,9 @@ This repository includes an optional logging proxy that captures all Anthropic A
 - Analyzing request/response patterns
 - Building custom analytics tools
 
-### Quick Start with Docker Compose
+### Running with Docker
 
-**Run Claude Code directly:**
-```bash
-cd example
-docker compose run claude-code claude
-```
-
-**Run with logging proxy:**
-```bash
-cd example
-# Start the proxy container
-docker compose up -d proxy
-# Run Claude Code (configured to use the proxy)
-docker compose run claude-code claude
-```
-
-The proxy will automatically intercept all API requests and log them to `./proxy-data/requests.db`.
-
-### Running with Docker (without Compose)
-
-**Run Claude Code directly:**
+**Run Claude Container directly:**
 ```bash
 docker run --rm -it \
   -v "$(pwd):/workspace" \
@@ -147,15 +160,6 @@ docker run --rm -it \
 docker stop claude-proxy
 docker rm claude-proxy
 docker network rm claude-network
-```
-
-### Viewing Logs
-
-```bash
-# Using sqlite3
-sqlite3 proxy-data/requests.db "SELECT timestamp, method, path, response_status, duration_ms FROM request_logs ORDER BY timestamp DESC LIMIT 10;"
-
-# Or use any SQLite browser tool
 ```
 
 ### Proxy Configuration
