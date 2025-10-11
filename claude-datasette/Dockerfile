@@ -10,7 +10,8 @@ RUN pip install --no-cache-dir \
     datasette-json-html \
     datasette-copyable \
     datasette-pretty-json \
-    datasette-export-notebook
+    datasette-export-notebook \
+    datasette-dashboards
 
 # Copy metadata and configuration
 COPY metadata.json /app/metadata.json
