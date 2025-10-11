@@ -169,3 +169,93 @@ The proxy supports the following environment variables:
 - `PROXY_PORT`: Port to listen on (default: `8080`)
 - `TARGET_API_URL`: Target API URL (default: `https://api.anthropic.com`)
 - `DB_PATH`: SQLite database path (default: `/data/requests.db`)
+
+## Data Visualization with Datasette
+
+This repository includes a Datasette container for exploring and visualizing the API request logs captured by the proxy. Datasette provides a web-based interface to explore your SQLite database with filtering, sorting, and export capabilities.
+
+### Features
+
+- **Browse Request Logs**: View all API requests with filtering and sorting
+- **JSON Visualization**: Pretty-print JSON request/response bodies
+- **Analytics**: Analyze request patterns, response times, and error rates
+- **Export Data**: Export filtered results to CSV, JSON, or Excel
+- **SQL Queries**: Run custom SQL queries against your data
+
+### Running with Datasette
+
+When using Docker Compose, you can add the Datasette service to visualize your proxy data:
+
+```yaml
+services:
+  claude-proxy:
+    image: nezhar/claude-proxy:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./proxy-data:/data
+
+  claude-datasette:
+    image: nezhar/claude-datasette:latest
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./proxy-data:/data:ro
+    depends_on:
+      - claude-proxy
+
+  claude-code:
+    image: nezhar/claude-container:latest
+    volumes:
+      - ./workspace:/workspace
+      - ./claude-config:/claude
+    environment:
+      CLAUDE_CONFIG_DIR: /claude
+      ANTHROPIC_BASE_URL: http://claude-proxy:8080
+    depends_on:
+      - claude-proxy
+```
+
+Start the services:
+```bash
+docker compose up -d claude-proxy claude-datasette
+docker compose run claude-code claude
+```
+
+Then access Datasette at http://localhost:8001 to explore your API request logs.
+
+### Using Datasette
+
+Once Datasette is running:
+
+1. **View All Requests**: Navigate to the `request_logs` table to see all captured API requests
+2. **Filter Data**: Use the faceted filters to narrow down by HTTP method, status code, etc.
+3. **Examine Details**: Click on individual requests to see full headers and JSON bodies
+4. **Run Queries**: Use the SQL interface to run custom analytics queries
+5. **Export Results**: Export filtered data in various formats for further analysis
+
+Example queries you might run:
+
+```sql
+-- Average response time by endpoint
+SELECT path, AVG(duration_ms) as avg_duration, COUNT(*) as request_count
+FROM request_logs
+GROUP BY path
+ORDER BY avg_duration DESC;
+
+-- Requests with errors
+SELECT timestamp, method, path, response_status, duration_ms
+FROM request_logs
+WHERE response_status >= 400
+ORDER BY timestamp DESC;
+
+-- Token usage over time (if captured in request_body)
+SELECT
+  DATE(timestamp) as date,
+  SUM(json_extract(response_body, '$.usage.input_tokens')) as input_tokens,
+  SUM(json_extract(response_body, '$.usage.output_tokens')) as output_tokens
+FROM request_logs
+WHERE json_extract(response_body, '$.usage') IS NOT NULL
+GROUP BY date
+ORDER BY date DESC;
+```

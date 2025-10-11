@@ -27,6 +27,55 @@ class ProxyLogger:
     def __init__(self, db_path: str):
         self.db_path = db_path
 
+    async def run_migrations(self, db):
+        """Run all SQL migration files in order."""
+        import pathlib
+        import glob
+
+        migrations_dir = pathlib.Path(__file__).parent / "migrations"
+        if not migrations_dir.exists():
+            print(f"No migrations directory found at {migrations_dir}")
+            return
+
+        # Create migrations tracking table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                filename TEXT PRIMARY KEY,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+
+        # Get list of already applied migrations
+        cursor = await db.execute("SELECT filename FROM schema_migrations")
+        applied = {row[0] for row in await cursor.fetchall()}
+
+        # Find and sort migration files
+        migration_files = sorted(migrations_dir.glob("*.sql"))
+
+        for migration_file in migration_files:
+            filename = migration_file.name
+            if filename in applied:
+                print(f"  ✓ Migration {filename} already applied")
+                continue
+
+            print(f"  → Applying migration {filename}...")
+            try:
+                sql_content = migration_file.read_text()
+                # Execute the migration (split by semicolon for multiple statements)
+                await db.executescript(sql_content)
+
+                # Record the migration as applied
+                await db.execute(
+                    "INSERT INTO schema_migrations (filename) VALUES (?)",
+                    (filename,)
+                )
+                await db.commit()
+                print(f"  ✓ Migration {filename} applied successfully")
+            except Exception as e:
+                print(f"  ✗ ERROR applying migration {filename}: {e}")
+                raise
+
     async def init_db(self):
         """Initialize the database schema."""
         import pathlib
@@ -92,6 +141,12 @@ class ProxyLogger:
                     print(f"✓ Table 'request_logs' exists")
                 else:
                     print(f"✗ ERROR: Table 'request_logs' was not created!")
+
+                # Run migrations
+                print("Running database migrations...")
+                await self.run_migrations(db)
+                print("✓ Migrations complete")
+
         except Exception as e:
             print(f"✗ ERROR initializing database: {e}")
             raise

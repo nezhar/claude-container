@@ -1,0 +1,55 @@
+{
+  "title": "Claude Code API Request Logs",
+  "description": "Explore Claude Code API requests and responses captured by the proxy",
+  "databases": {
+    "requests": {
+      "source": "Claude Proxy Logger",
+      "source_url": "https://github.com/nezhar/claude-container",
+      "tables": {
+        "request_logs": {
+          "title": "API Request Logs",
+          "description": "All Anthropic API requests and responses",
+          "sort_desc": "timestamp",
+          "facets": ["method", "response_status"],
+          "columns": {
+            "timestamp": "Request Time",
+            "method": "HTTP Method",
+            "path": "API Path",
+            "target_url": "Full URL",
+            "response_status": "Status Code",
+            "duration_ms": "Duration (ms)"
+          }
+        },
+        "v_flatten_request_headers": {
+          "title": "Request Headers (Flattened)",
+          "description": "All request headers as individual rows with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "header_name"]
+        },
+        "v_flatten_response_headers": {
+          "title": "Response Headers (Flattened)",
+          "description": "All response headers as individual rows with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "response_status", "header_name"]
+        },
+        "v_flatten_request_body": {
+          "title": "Request Body (Flattened)",
+          "description": "All request body fields as individual rows with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "field_name"]
+        },
+        "v_full_request_data": {
+          "title": "Full Request Data (Flattened)",
+          "description": "Combined headers and body with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "data_type", "key_name"]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "datasette-json-html": {
+      "columns": ["request_headers", "request_body", "response_headers", "response_body"]
+    }
+  }
+}

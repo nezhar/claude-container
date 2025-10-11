@@ -8,8 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy proxy application
+# Copy proxy application and migrations
 COPY proxy.py .
+COPY migrations/ ./migrations/
 
 # Create data directory for SQLite database
 RUN mkdir -p /data && chmod 777 /data

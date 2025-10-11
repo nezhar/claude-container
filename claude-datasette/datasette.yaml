@@ -1,0 +1,121 @@
+databases:
+  requests:
+    queries:
+      flatten_request_headers:
+        title: Flatten Request Headers
+        description: View all request headers as individual rows for analysis
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, json_each.key as header_name, json_each.value as header_value FROM request_logs, json_each(request_logs.request_headers) ORDER BY request_logs.timestamp DESC
+      flatten_response_headers:
+        title: Flatten Response Headers
+        description: View all response headers as individual rows for analysis
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, request_logs.response_status, json_each.key as header_name, json_each.value as header_value FROM request_logs, json_each(request_logs.response_headers) ORDER BY request_logs.timestamp DESC
+      flatten_request_body:
+        title: Flatten Request Body
+        description: View all request body fields as individual rows for analysis
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, json_each.key as field_name, json_each.value as field_value FROM request_logs, json_each(request_logs.request_body) ORDER BY request_logs.timestamp DESC
+      flatten_response_body:
+        title: Flatten Response Body
+        description: View all response body fields as individual rows for analysis (for JSON responses)
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, request_logs.response_status, json_each.key as field_name, json_each.value as field_value FROM request_logs, json_each(request_logs.response_body) WHERE json_valid(request_logs.response_body) ORDER BY request_logs.timestamp DESC
+      request_headers_by_name:
+        title: Search Request Headers by Name
+        description: Find all occurrences of a specific header in requests
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, json_each.key as header_name, json_each.value as header_value FROM request_logs, json_each(request_logs.request_headers) WHERE json_each.key = :header_name ORDER BY request_logs.timestamp DESC
+        params:
+          - header_name
+      response_headers_by_name:
+        title: Search Response Headers by Name
+        description: Find all occurrences of a specific header in responses
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, request_logs.response_status, json_each.key as header_name, json_each.value as header_value FROM request_logs, json_each(request_logs.response_headers) WHERE json_each.key = :header_name ORDER BY request_logs.timestamp DESC
+        params:
+          - header_name
+      headers_by_name:
+        title: Search All Headers by Name (Exact)
+        description: Find all occurrences of a specific header in both requests and responses (exact match)
+        sql: |
+          SELECT
+            request_logs.id,
+            request_logs.timestamp,
+            request_logs.method,
+            request_logs.path,
+            'request' as header_source,
+            h.key as header_name,
+            h.value as header_value
+          FROM request_logs, json_each(request_logs.request_headers) as h
+          WHERE h.key = :header_name
+          UNION ALL
+          SELECT
+            request_logs.id,
+            request_logs.timestamp,
+            request_logs.method,
+            request_logs.path,
+            'response' as header_source,
+            h.key as header_name,
+            h.value as header_value
+          FROM request_logs, json_each(request_logs.response_headers) as h
+          WHERE h.key = :header_name
+          ORDER BY timestamp DESC
+        params:
+          - header_name
+      headers_by_pattern:
+        title: Search Headers by Pattern (Wildcard)
+        description: Find headers matching a pattern. Use % for any characters, _ for single character (e.g., "X-%" finds all X- headers, "%Agent%" finds User-Agent, etc.)
+        sql: |
+          SELECT
+            request_logs.id,
+            request_logs.timestamp,
+            request_logs.method,
+            request_logs.path,
+            'request' as header_source,
+            h.key as header_name,
+            h.value as header_value
+          FROM request_logs, json_each(request_logs.request_headers) as h
+          WHERE h.key LIKE :pattern
+          UNION ALL
+          SELECT
+            request_logs.id,
+            request_logs.timestamp,
+            request_logs.method,
+            request_logs.path,
+            'response' as header_source,
+            h.key as header_name,
+            h.value as header_value
+          FROM request_logs, json_each(request_logs.response_headers) as h
+          WHERE h.key LIKE :pattern
+          ORDER BY timestamp DESC
+        params:
+          - pattern
+      request_body_field:
+        title: Search Request Body by Field
+        description: Find all occurrences of a specific field in request bodies
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, json_each.key as field_name, json_each.value as field_value FROM request_logs, json_each(request_logs.request_body) WHERE json_each.key = :field_name ORDER BY request_logs.timestamp DESC
+        params:
+          - field_name
+      user_agents:
+        title: User Agent Analysis
+        description: All User-Agent headers from requests
+        sql: SELECT request_logs.id, request_logs.timestamp, request_logs.method, request_logs.path, json_each.value as user_agent FROM request_logs, json_each(request_logs.request_headers) WHERE json_each.key = 'User-Agent' ORDER BY request_logs.timestamp DESC
+      full_request_data:
+        title: Full Request Data (Flattened)
+        description: Complete view with headers and body fields combined
+        sql: |
+          SELECT
+            request_logs.id,
+            request_logs.timestamp,
+            request_logs.method,
+            request_logs.path,
+            'header' as data_type,
+            h.key as key_name,
+            h.value as value_data
+          FROM request_logs, json_each(request_logs.request_headers) as h
+          UNION ALL
+          SELECT
+            request_logs.id,
+            request_logs.timestamp,
+            request_logs.method,
+            request_logs.path,
+            'body' as data_type,
+            b.key as key_name,
+            b.value as value_data
+          FROM request_logs, json_each(request_logs.request_body) as b
+          ORDER BY timestamp DESC, id, data_type
