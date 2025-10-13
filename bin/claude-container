@@ -176,7 +176,6 @@ start_proxy() {
         --name "$PROXY_CONTAINER_NAME" \
         --network "$NETWORK_NAME" \
         -v "$PROXY_DATA_DIR:/data" \
-        -p 8080:8080 \
         "$PROXY_IMAGE"
 
     echo -e "${GREEN}Proxy started successfully${NC}"
