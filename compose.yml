@@ -5,6 +5,12 @@ services:
       context: ./claude-proxy
       dockerfile: Dockerfile
 
+  claude-datasette:
+    image: nezhar/claude-datasette:${CLAUDE_CONTAINER_VERSION:-latest}
+    build:
+      context: ./claude-datasette
+      dockerfile: Dockerfile
+
   claude-code:
     image: nezhar/claude-container:${CLAUDE_CONTAINER_VERSION:-latest}
     build:

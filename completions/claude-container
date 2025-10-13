@@ -1,0 +1,93 @@
+#!/bin/bash
+# Bash completion script for claude-container
+# Install to ~/.local/share/bash-completion/completions/claude-container
+# or /etc/bash_completion.d/claude-container (system-wide)
+
+_claude_container_completion() {
+    local cur prev words cword
+    _init_completion || return
+
+    # All available flags
+    local flags="
+        --workspace -w
+        --config -c
+        --proxy
+        --proxy-data
+        --proxy-stop
+        --proxy-logs
+        --datasette
+        --datasette-only
+        --datasette-port
+        --datasette-stop
+        --datasette-logs
+        --pull
+        --version
+        --help -h
+    "
+
+    # Flags that expect a directory path
+    local dir_flags="--workspace -w --config -c --proxy-data"
+
+    # Flags that expect a port number
+    local port_flags="--datasette-port"
+
+    # Flags that don't take arguments (actions)
+    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --pull --version --help -h"
+
+    case "$prev" in
+        --workspace|-w|--config|-c|--proxy-data)
+            # Complete with directories only
+            _filedir -d
+            return 0
+            ;;
+        --datasette-port)
+            # Suggest common ports
+            COMPREPLY=($(compgen -W "8001 8002 8080 3000 4000 5000" -- "$cur"))
+            return 0
+            ;;
+    esac
+
+    # If current word starts with -, complete with flags
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+        return 0
+    fi
+
+    # If we've already seen certain flags, limit what we suggest
+    local i
+    local seen_proxy=false
+    local seen_stop=false
+    local seen_logs=false
+
+    for ((i=1; i < cword; i++)); do
+        case "${words[i]}" in
+            --proxy)
+                seen_proxy=true
+                ;;
+            --proxy-stop|--datasette-stop)
+                seen_stop=true
+                ;;
+            --proxy-logs|--datasette-logs)
+                seen_logs=true
+                ;;
+        esac
+    done
+
+    # If user has already used a stop or logs command, suggest only those
+    if [[ "$seen_stop" == true ]]; then
+        COMPREPLY=($(compgen -W "--proxy-stop --datasette-stop" -- "$cur"))
+        return 0
+    fi
+
+    if [[ "$seen_logs" == true ]]; then
+        COMPREPLY=($(compgen -W "--proxy-logs --datasette-logs" -- "$cur"))
+        return 0
+    fi
+
+    # Default: suggest all flags
+    COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+    return 0
+}
+
+# Register the completion function
+complete -F _claude_container_completion claude-container

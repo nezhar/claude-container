@@ -8,6 +8,16 @@ services:
     environment:
       TARGET_API_URL: https://api.anthropic.com
 
+  claude-datasette:
+    image: nezhar/claude-datasette:latest
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./proxy-data:/data:ro
+      - ./datasette-metadata.json:/app/metadata.json:ro
+    depends_on:
+      - claude-proxy
+
   claude-code:
     image: nezhar/claude-container:latest
     volumes:

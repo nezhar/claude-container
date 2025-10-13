@@ -1,0 +1,369 @@
+{
+  "title": "Claude Code API Request Logs",
+  "description": "Explore Claude Code API requests and responses captured by the proxy",
+  "databases": {
+    "requests": {
+      "source": "Claude Proxy Logger",
+      "source_url": "https://github.com/nezhar/claude-container",
+      "tables": {
+        "request_logs": {
+          "title": "API Request Logs",
+          "description": "All Anthropic API requests and responses",
+          "sort_desc": "timestamp",
+          "facets": ["method", "response_status"],
+          "columns": {
+            "timestamp": "Request Time",
+            "method": "HTTP Method",
+            "path": "API Path",
+            "target_url": "Full URL",
+            "response_status": "Status Code",
+            "duration_ms": "Duration (ms)"
+          }
+        },
+        "v_flatten_request_headers": {
+          "title": "Request Headers (Flattened)",
+          "description": "All request headers as individual rows with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "header_name"]
+        },
+        "v_flatten_response_headers": {
+          "title": "Response Headers (Flattened)",
+          "description": "All response headers as individual rows with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "response_status", "header_name"]
+        },
+        "v_flatten_request_body": {
+          "title": "Request Body (Flattened)",
+          "description": "All request body fields as individual rows with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "field_name"]
+        },
+        "v_full_request_data": {
+          "title": "Full Request Data (Flattened)",
+          "description": "Combined headers and body with faceting support",
+          "sort_desc": "timestamp",
+          "facets": ["method", "path", "data_type", "key_name"]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "datasette-json-html": {
+      "columns": ["request_headers", "request_body", "response_headers", "response_body"]
+    },
+    "datasette-dashboards": {
+      "api-overview": {
+        "title": "API Request Overview",
+        "description": "Overview dashboard for Claude API proxy logs",
+        "settings": {
+          "allow_fullscreen": true
+        },
+        "filters": {},
+        "layout": [
+          ["total-requests", "success-rate", "avg-response-time", "avg-response-time"],
+          ["total-input-tokens", "total-cache-creation-tokens", "total-cache-read-tokens", "total-output-tokens"],
+          ["requests-timeline", "requests-timeline", "requests-timeline", "requests-timeline"],
+          ["requests-by-status", "requests-by-status", "requests-by-path", "requests-by-path"],
+          ["recent-requests", "recent-requests", "slowest-requests", "slowest-requests"]
+        ],
+        "charts": {
+          "total-requests": {
+            "title": "Total Requests",
+            "db": "requests",
+            "query": "SELECT COUNT(*) as value FROM request_logs",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "success-rate": {
+            "title": "Success Rate",
+            "db": "requests",
+            "query": "SELECT ROUND(CAST(SUM(CASE WHEN response_status < 400 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) * 100, 2) as value FROM request_logs",
+            "library": "metric",
+            "display": {
+              "field": "value",
+              "suffix": "%"
+            }
+          },
+          "avg-response-time": {
+            "title": "Avg Response Time",
+            "db": "requests",
+            "query": "SELECT ROUND(AVG(duration_ms), 2) as value FROM request_logs",
+            "library": "metric",
+            "display": {
+              "field": "value",
+              "suffix": "ms"
+            }
+          },
+          "total-input-tokens": {
+            "title": "Total Input Tokens",
+            "db": "requests",
+            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "total-cache-creation-tokens": {
+            "title": "Total Cache Creation Tokens",
+            "db": "requests",
+            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.cache_creation_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.cache_creation_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "total-cache-read-tokens": {
+            "title": "Total Cache Read Tokens",
+            "db": "requests",
+            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.cache_read_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.cache_read_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "total-output-tokens": {
+            "title": "Total Output Tokens",
+            "db": "requests",
+            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.output_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.output_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "requests-timeline": {
+            "title": "Requests Over Past 24 Hours (5-min intervals)",
+            "db": "requests",
+            "query": "SELECT datetime(((strftime('%s', timestamp) / 300) * 300), 'unixepoch') as time, COUNT(*) as count FROM request_logs WHERE datetime(timestamp) >= datetime('now', '-24 hours') GROUP BY (strftime('%s', timestamp) / 300) ORDER BY time",
+            "library": "vega-lite",
+            "display": {
+              "mark": {
+                "type": "line",
+                "point": true,
+                "tooltip": true
+              },
+              "encoding": {
+                "x": {
+                  "field": "time",
+                  "type": "temporal",
+                  "title": "Time",
+                  "axis": {
+                    "format": "%H:%M"
+                  }
+                },
+                "y": {
+                  "field": "count",
+                  "type": "quantitative",
+                  "title": "Number of Requests"
+                }
+              }
+            }
+          },
+          "recent-requests": {
+            "title": "Recent API Requests",
+            "db": "requests",
+            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs ORDER BY timestamp DESC LIMIT 20",
+            "library": "table"
+          },
+          "requests-by-status": {
+            "title": "Requests by Status Code",
+            "db": "requests",
+            "query": "SELECT response_status, json_extract(response_headers, '$.Content-Type') as content_type, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_duration_ms FROM request_logs GROUP BY response_status, json_extract(response_headers, '$.Content-Type') ORDER BY count DESC",
+            "library": "table"
+          },
+          "requests-by-path": {
+            "title": "Requests by Path",
+            "db": "requests",
+            "query": "SELECT path, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_duration_ms FROM request_logs GROUP BY path ORDER BY count DESC",
+            "library": "table"
+          },
+          "slowest-requests": {
+            "title": "Slowest Requests",
+            "db": "requests",
+            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs ORDER BY duration_ms DESC LIMIT 10",
+            "library": "table"
+          }
+        }
+      },
+      "headers-analysis": {
+        "title": "Headers Analysis",
+        "description": "Analyze request and response headers",
+        "settings": {
+          "allow_fullscreen": true
+        },
+        "filters": {},
+        "layout": [
+          ["unique-request-headers", "unique-request-headers", "unique-response-headers", "unique-response-headers"],
+          ["common-request-headers", "common-request-headers", "common-response-headers", "common-response-headers"],
+          ["user-agents", "user-agents", "user-agents", "user-agents"]
+        ],
+        "charts": {
+          "unique-request-headers": {
+            "title": "Unique Request Headers",
+            "db": "requests",
+            "query": "SELECT COUNT(DISTINCT header_name) as value FROM v_flatten_request_headers",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "unique-response-headers": {
+            "title": "Unique Response Headers",
+            "db": "requests",
+            "query": "SELECT COUNT(DISTINCT header_name) as value FROM v_flatten_response_headers",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "common-request-headers": {
+            "title": "Most Common Request Headers",
+            "db": "requests",
+            "query": "SELECT header_name, COUNT(*) as count FROM v_flatten_request_headers GROUP BY header_name ORDER BY count DESC LIMIT 15",
+            "library": "table"
+          },
+          "common-response-headers": {
+            "title": "Most Common Response Headers",
+            "db": "requests",
+            "query": "SELECT header_name, COUNT(*) as count FROM v_flatten_response_headers GROUP BY header_name ORDER BY count DESC LIMIT 15",
+            "library": "table"
+          },
+          "user-agents": {
+            "title": "User Agents",
+            "db": "requests",
+            "query": "SELECT user_agent, COUNT(*) as count FROM (SELECT json_extract(value, '$') as user_agent FROM request_logs, json_each(request_headers) WHERE key = 'User-Agent') GROUP BY user_agent ORDER BY count DESC LIMIT 10",
+            "library": "table"
+          }
+        }
+      },
+      "errors": {
+        "title": "Error Analysis",
+        "description": "Track and analyze API errors",
+        "settings": {
+          "allow_fullscreen": true
+        },
+        "filters": {},
+        "layout": [
+          ["total-errors", "error-rate", "4xx-errors", "5xx-errors"],
+          ["recent-errors", "recent-errors", "recent-errors", "recent-errors"],
+          ["error-distribution", "error-distribution", "error-distribution", "error-distribution"]
+        ],
+        "charts": {
+          "total-errors": {
+            "title": "Total Errors",
+            "db": "requests",
+            "query": "SELECT COUNT(*) as value FROM request_logs WHERE response_status >= 400",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "error-rate": {
+            "title": "Error Rate",
+            "db": "requests",
+            "query": "SELECT ROUND(CAST(SUM(CASE WHEN response_status >= 400 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) * 100, 2) as value FROM request_logs",
+            "library": "metric",
+            "display": {
+              "field": "value",
+              "suffix": "%"
+            }
+          },
+          "4xx-errors": {
+            "title": "4xx Errors",
+            "db": "requests",
+            "query": "SELECT COUNT(*) as value FROM request_logs WHERE response_status >= 400 AND response_status < 500",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "5xx-errors": {
+            "title": "5xx Errors",
+            "db": "requests",
+            "query": "SELECT COUNT(*) as value FROM request_logs WHERE response_status >= 500",
+            "library": "metric",
+            "display": {
+              "field": "value"
+            }
+          },
+          "recent-errors": {
+            "title": "Recent Errors",
+            "db": "requests",
+            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs WHERE response_status >= 400 ORDER BY timestamp DESC LIMIT 20",
+            "library": "table"
+          },
+          "error-distribution": {
+            "title": "Error Distribution",
+            "db": "requests",
+            "query": "SELECT response_status, path, COUNT(*) as count FROM request_logs WHERE response_status >= 400 GROUP BY response_status, path ORDER BY count DESC LIMIT 15",
+            "library": "table"
+          }
+        }
+      },
+      "performance": {
+        "title": "Performance Metrics",
+        "description": "Analyze API performance and response times",
+        "settings": {
+          "allow_fullscreen": true
+        },
+        "filters": {},
+        "layout": [
+          ["min-response-time", "max-response-time", "median-response-time", "median-response-time"],
+          ["performance-by-endpoint", "performance-by-endpoint", "performance-by-endpoint", "performance-by-endpoint"],
+          ["fast-requests", "fast-requests", "slow-requests", "slow-requests"]
+        ],
+        "charts": {
+          "min-response-time": {
+            "title": "Min Response Time",
+            "db": "requests",
+            "query": "SELECT ROUND(MIN(duration_ms), 2) as value FROM request_logs",
+            "library": "metric",
+            "display": {
+              "field": "value",
+              "suffix": "ms"
+            }
+          },
+          "max-response-time": {
+            "title": "Max Response Time",
+            "db": "requests",
+            "query": "SELECT ROUND(MAX(duration_ms), 2) as value FROM request_logs",
+            "library": "metric",
+            "display": {
+              "field": "value",
+              "suffix": "ms"
+            }
+          },
+          "median-response-time": {
+            "title": "Median Response Time",
+            "db": "requests",
+            "query": "SELECT ROUND((SELECT duration_ms FROM request_logs ORDER BY duration_ms LIMIT 1 OFFSET (SELECT COUNT(*) FROM request_logs) / 2), 2) as value",
+            "library": "metric",
+            "display": {
+              "field": "value",
+              "suffix": "ms"
+            }
+          },
+          "performance-by-endpoint": {
+            "title": "Performance by Endpoint",
+            "db": "requests",
+            "query": "SELECT path, COUNT(*) as requests, ROUND(MIN(duration_ms), 2) as min_ms, ROUND(AVG(duration_ms), 2) as avg_ms, ROUND(MAX(duration_ms), 2) as max_ms FROM request_logs GROUP BY path ORDER BY avg_ms DESC",
+            "library": "table"
+          },
+          "fast-requests": {
+            "title": "Fast Requests (< 100ms)",
+            "db": "requests",
+            "query": "SELECT path, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_ms FROM request_logs WHERE duration_ms < 100 GROUP BY path ORDER BY count DESC LIMIT 10",
+            "library": "table"
+          },
+          "slow-requests": {
+            "title": "Slow Requests (> 1000ms)",
+            "db": "requests",
+            "query": "SELECT path, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_ms FROM request_logs WHERE duration_ms > 1000 GROUP BY path ORDER BY count DESC LIMIT 10",
+            "library": "table"
+          }
+        }
+      }
+    }
+  }
+}
