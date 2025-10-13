@@ -12,13 +12,14 @@ Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com
 
 ## Compatibility Matrix
 
-**Latest Release:** 1.2.0 (Claude Code 2.0.13)
+**Latest Release:** 1.3.0 (Claude Code 2.0.14)
 
 | Container Version | Claude Code Version |
 |-------------------|---------------------|
 | 1.0.x             | 1.0.x               |
 | 1.1.x             | 2.0.x               |
 | 1.2.x             | 2.0.x               |
+| 1.3.x             | 2.0.x              |
 
 ## Quick Start
 

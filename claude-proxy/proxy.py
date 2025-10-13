@@ -50,13 +50,31 @@ class ProxyLogger:
         cursor = await db.execute("SELECT filename FROM schema_migrations")
         applied = {row[0] for row in await cursor.fetchall()}
 
+        # Check if request_logs table already exists (created by old Python code)
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='request_logs'"
+        )
+        table_exists = await cursor.fetchone() is not None
+
+        # If table exists but 000_initial.sql wasn't tracked, mark it as applied
+        if table_exists and "000_initial.sql" not in applied:
+            print("  ✓ Migration 000_initial.sql already applied (table exists from previous setup)")
+            await db.execute(
+                "INSERT INTO schema_migrations (filename) VALUES (?)",
+                ("000_initial.sql",)
+            )
+            await db.commit()
+            applied.add("000_initial.sql")
+
         # Find and sort migration files
         migration_files = sorted(migrations_dir.glob("*.sql"))
 
         for migration_file in migration_files:
             filename = migration_file.name
             if filename in applied:
-                print(f"  ✓ Migration {filename} already applied")
+                # Skip printing for 000_initial.sql if we just auto-marked it above
+                if not (table_exists and filename == "000_initial.sql"):
+                    print(f"  ✓ Migration {filename} already applied")
                 continue
 
             print(f"  → Applying migration {filename}...")
@@ -77,7 +95,7 @@ class ProxyLogger:
                 raise
 
     async def init_db(self):
-        """Initialize the database schema."""
+        """Initialize the database schema via migrations."""
         import pathlib
 
         # Ensure database directory exists
@@ -87,51 +105,10 @@ class ProxyLogger:
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                # Create table if not exists with JSON fields
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS request_logs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp TEXT NOT NULL,
-                        method TEXT NOT NULL,
-                        path TEXT NOT NULL,
-                        target_url TEXT NOT NULL,
-                        request_headers JSON,
-                        request_body JSON,
-                        response_status INTEGER,
-                        response_headers JSON,
-                        response_body TEXT,
-                        duration_ms INTEGER,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
-                # Check if target_url column exists (for migration)
-                cursor = await db.execute("PRAGMA table_info(request_logs)")
-                columns = await cursor.fetchall()
-                column_names = [col[1] for col in columns]
-
-                # Add target_url column if it doesn't exist (migration from old schema)
-                if columns and 'target_url' not in column_names:
-                    print("Migrating database: adding target_url column...")
-                    await db.execute("""
-                        ALTER TABLE request_logs
-                        ADD COLUMN target_url TEXT DEFAULT ''
-                    """)
-                    print("Migration complete!")
-
-                # Migrate existing TEXT columns to JSON if needed
-                if columns:
-                    # Check the type of request_headers column
-                    for col in columns:
-                        col_name = col[1]
-                        col_type = col[2]
-                        if col_name in ('request_headers', 'response_headers', 'request_body') and col_type == 'TEXT':
-                            print(f"Note: Column '{col_name}' is TEXT type. Consider recreating the table to use JSON type for better querying.")
-                            # SQLite doesn't support ALTER COLUMN TYPE, so we note this but continue
-                            # The actual stored values will be JSON strings which work fine
-                            break
-
-                await db.commit()
+                # Run all migrations (including initial schema creation)
+                print("Running database migrations...")
+                await self.run_migrations(db)
+                print("✓ Migrations complete")
 
                 # Verify table was created
                 cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='request_logs'")
@@ -141,11 +118,6 @@ class ProxyLogger:
                     print(f"✓ Table 'request_logs' exists")
                 else:
                     print(f"✗ ERROR: Table 'request_logs' was not created!")
-
-                # Run migrations
-                print("Running database migrations...")
-                await self.run_migrations(db)
-                print("✓ Migrations complete")
 
         except Exception as e:
             print(f"✗ ERROR initializing database: {e}")
