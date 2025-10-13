@@ -52,6 +52,21 @@ The script handles all Docker configuration automatically and supports additiona
 claude-container --help
 ```
 
+#### Optional: Enable Tab Completion
+
+To enable bash tab completion for the `claude-container` command:
+
+```bash
+# Download and install completion script
+mkdir -p ~/.local/share/bash-completion/completions
+curl -o ~/.local/share/bash-completion/completions/claude-container https://raw.githubusercontent.com/nezhar/claude-container/main/completions/claude-container
+
+# Reload your shell or start a new terminal session
+source ~/.bashrc
+```
+
+Once installed, you can use tab completion with `claude-container --<TAB>` to see all available options
+
 ### Using Docker Compose
 
 Create a `compose.yml` file as provided in the example folder. 
