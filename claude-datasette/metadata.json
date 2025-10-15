@@ -63,6 +63,7 @@
           ["total-requests", "success-rate", "avg-response-time", "avg-response-time"],
           ["total-input-tokens", "total-cache-creation-tokens", "total-cache-read-tokens", "total-output-tokens"],
           ["requests-timeline", "requests-timeline", "requests-timeline", "requests-timeline"],
+          ["requests-by-user-agent", "requests-by-user-agent", "requests-by-model", "requests-by-model"],
           ["requests-by-status", "requests-by-status", "requests-by-path", "requests-by-path"],
           ["recent-requests", "recent-requests", "slowest-requests", "slowest-requests"]
         ],
@@ -95,6 +96,18 @@
               "field": "value",
               "suffix": "ms"
             }
+          },
+          "requests-by-user-agent": {
+            "title": "Requests by User Agent",
+            "db": "requests",
+            "query": "SELECT json_extract(request_headers, '$.User-Agent') as user_agent, COUNT(*) as count FROM request_logs WHERE json_extract(request_headers, '$.User-Agent') IS NOT NULL GROUP BY json_extract(request_headers, '$.User-Agent') ORDER BY count DESC",
+            "library": "table"
+          },
+          "requests-by-model": {
+            "title": "Requests by Model",
+            "db": "requests",
+            "query": "SELECT json_extract(request_body, '$.model') as model, COUNT(*) as count FROM request_logs WHERE json_extract(request_body, '$.model') IS NOT NULL GROUP BY json_extract(request_body, '$.model') ORDER BY count DESC",
+            "library": "table"
           },
           "total-input-tokens": {
             "title": "Total Input Tokens",
