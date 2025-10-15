@@ -25,9 +25,16 @@ EXPOSE 8001
 
 # Configure datasette to be accessible from outside the container
 # Point to the same database path that the proxy uses
+# Performance settings optimized for large databases
 CMD ["datasette", "/data/requests.db", \
      "--host", "0.0.0.0", \
      "--port", "8001", \
      "--cors", \
      "--metadata", "/app/metadata.json", \
-     "--config", "/app/datasette.yaml"]
+     "--config", "/app/datasette.yaml", \
+     "--setting", "max_returned_rows", "100", \
+     "--setting", "sql_time_limit_ms", "5000", \
+     "--setting", "default_page_size", "50", \
+     "--setting", "cache_size_kb", "10000", \
+     "--setting", "default_cache_ttl", "60", \
+     "--setting", "num_sql_threads", "8"]
