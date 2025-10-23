@@ -1,5 +1,7 @@
 # Claude Container
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/nezhar/claude-container)
+
 A Docker container with Claude Code pre-installed and ready to use.
 
 This container includes all necessary dependencies and provides an easy way to run Claude Code in an isolated environment.
