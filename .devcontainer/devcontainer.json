@@ -1,0 +1,30 @@
+{
+  "name": "Claude Container",
+  "image": "nezhar/claude-container:latest",
+  
+  "features": {},
+  
+  "customizations": {
+    "vscode": {
+      "extensions": [],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "sh"
+      }
+    }
+  },
+  
+  "remoteEnv": {
+    "CLAUDE_CONFIG_DIR": "/claude"
+  },
+  
+  "mounts": [
+    "source=claude-container-config,target=/claude,type=volume"
+  ],
+  
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  
+  "postCreateCommand": "echo 'Claude Code container ready! Run: claude'",
+  
+  "remoteUser": "node"
+}
