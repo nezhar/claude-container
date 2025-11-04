@@ -26,7 +26,7 @@ set -e
 
 # Version information
 # Container and proxy are always released with the same version
-VERSION="1.3.2"
+VERSION="1.4.0"
 
 # Default values
 WORKSPACE_DIR="$(pwd)"
@@ -453,6 +453,8 @@ if [ "$USE_PROXY" = true ]; then
         -v "$CONFIG_DIR:/claude" \
         -e "CLAUDE_CONFIG_DIR=/claude" \
         -e "ANTHROPIC_BASE_URL=http://$PROXY_CONTAINER_NAME:8080" \
+        -e "USER_UID=$(id -u)" \
+        -e "USER_GID=$(id -g)" \
         "$IMAGE" \
         $COMMAND
 
@@ -477,6 +479,8 @@ else
         -v "$WORKSPACE_DIR:/workspace" \
         -v "$CONFIG_DIR:/claude" \
         -e "CLAUDE_CONFIG_DIR=/claude" \
+        -e "USER_UID=$(id -u)" \
+        -e "USER_GID=$(id -g)" \
         "$IMAGE" \
         $COMMAND
 fi
