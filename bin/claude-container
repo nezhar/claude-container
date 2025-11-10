@@ -65,8 +65,8 @@ OPTIONS:
     -w, --workspace <path>      Set workspace directory (default: current directory)
     -c, --config <path>         Set config directory (default: \$HOME/.config/claude-container/config)
     -h, --help                  Show this help message
+    -v, --version               Show version information (Claude Container, Claude Code, Docker)
     --pull                      Pull latest images before running
-    --version                   Show container version information
 
 PROXY OPTIONS:
     --proxy                     Enable API logging proxy
@@ -309,9 +309,25 @@ while [[ $# -gt 0 ]]; do
             PULL_IMAGES=true
             shift
             ;;
-        --version)
-            echo -e "${GREEN}Running version check...${NC}"
-            docker run --rm "$IMAGE" claude --version
+        -v|--version)
+            echo -e "${GREEN}Claude Container Version Information${NC}"
+            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo -e "Claude Container: ${YELLOW}v${VERSION}${NC}"
+
+            # Get Claude Code version from the container
+            # Try to extract version, handle both formats: "vX.Y.Z" and "X.Y.Z"
+            CLAUDE_VERSION=$(docker run --rm "$IMAGE" claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            if [ -z "$CLAUDE_VERSION" ]; then
+                CLAUDE_VERSION="unknown"
+            else
+                CLAUDE_VERSION="v${CLAUDE_VERSION}"
+            fi
+            echo -e "Claude Code:      ${YELLOW}${CLAUDE_VERSION}${NC}"
+
+            # Get Docker version
+            DOCKER_VERSION=$(docker --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "unknown")
+            echo -e "Docker:           ${YELLOW}${DOCKER_VERSION}${NC}"
+            echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             exit 0
             ;;
         *)

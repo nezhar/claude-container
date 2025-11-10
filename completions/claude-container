@@ -21,7 +21,7 @@ _claude_container_completion() {
         --datasette-stop
         --datasette-logs
         --pull
-        --version
+        --version -v
         --help -h
     "
 
@@ -32,7 +32,7 @@ _claude_container_completion() {
     local port_flags="--datasette-port"
 
     # Flags that don't take arguments (actions)
-    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --pull --version --help -h"
+    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --pull --version -v --help -h"
 
     case "$prev" in
         --workspace|-w|--config|-c|--proxy-data)
