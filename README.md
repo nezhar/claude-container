@@ -6,9 +6,44 @@ This container includes all necessary dependencies and provides an easy way to r
 
 An optional proxy can be enabled to track all the requests made by Claude Code in a local SQLite database.
 
-## Docker Hub
+## Available Images
 
-Images available on Docker Hub: [nezhar/claude-container](https://hub.docker.com/r/nezhar/claude-container) and [nezhar/claude-proxy](https://hub.docker.com/r/nezhar/claude-proxy)
+Three Docker images are available on Docker Hub, all released with matching version tags:
+
+| Image | Purpose | Base |
+|-------|---------|------|
+| [nezhar/claude-container](https://hub.docker.com/r/nezhar/claude-container) | Main container with Claude Code CLI pre-installed | Node.js 22 Alpine |
+| [nezhar/claude-proxy](https://hub.docker.com/r/nezhar/claude-proxy) | Optional HTTP proxy that logs all API requests to SQLite | Python 3.12 Alpine |
+| [nezhar/claude-datasette](https://hub.docker.com/r/nezhar/claude-datasette) | Optional web UI for visualizing and querying logged requests | Datasette + plugins |
+
+### Architecture Overview
+
+When using all three images together, the request flow looks like this:
+
+```
+┌─────────────────┐      ┌──────────────────┐      ┌─────────────────────┐
+│ claude-container│─────▶│  claude-proxy    │─────▶│  api.anthropic.com  │
+│  (Claude Code)  │      │   (HTTP Proxy)   │      │   (Anthropic API)   │
+└─────────────────┘      └────────┬─────────┘      └─────────────────────┘
+                                  │
+                                  ▼
+                         ┌─────────────────┐
+                         │  requests.db    │
+                         │   (SQLite)      │
+                         └────────┬────────┘
+                                  │
+                                  ▼
+                         ┌─────────────────┐
+                         │claude-datasette │
+                         │   (Web UI)      │
+                         └─────────────────┘
+                         http://localhost:8001
+```
+
+**Standalone Usage:**
+- Use **claude-container** alone for basic Claude Code functionality
+- Add **claude-proxy** when you need API request logging
+- Add **claude-datasette** when you want to visualize and analyze logs
 
 ## Compatibility Matrix
 
