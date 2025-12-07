@@ -42,9 +42,13 @@ else
     USER_NAME=$(getent passwd "$USER_UID" | cut -d: -f1)
 fi
 
-# Fix ownership of config directory (usually needs fixing on first run)
+# Ensure config directory is accessible without modifying existing credential files
+# Only fix ownership of the directory itself, not its contents
 if [ -d /claude ]; then
-    chown -R "$USER_UID:$USER_GID" /claude 2>/dev/null || true
+    # Change ownership of the directory itself
+    chown "$USER_UID:$USER_GID" /claude 2>/dev/null || true
+    # Ensure it's writable
+    chmod 755 /claude 2>/dev/null || true
 fi
 
 # Don't recursively chown workspace - files created by the container will automatically
