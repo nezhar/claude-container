@@ -47,7 +47,7 @@ When using all three images together, the request flow looks like this:
 
 ## Compatibility Matrix
 
-**Latest Release:** 1.4.9 (Claude Code 2.0.76)
+**Latest Release:** 1.5.0 (Claude Code 2.1.2)
 
 | Container Version | Claude Code Version |
 |-------------------|---------------------|
@@ -56,6 +56,7 @@ When using all three images together, the request flow looks like this:
 | 1.2.x             | 2.0.x               |
 | 1.3.x             | 2.0.x               |
 | 1.4.x             | 2.0.x               |
+| 1.5.x             | 2.1.x               |
 
 ## Quick Start
 
