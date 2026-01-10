@@ -1,8 +1,8 @@
 # Use official Node.js Alpine image
 FROM node:22-alpine
 
-# Install git and su-exec (required by Claude Code and entrypoint)
-RUN apk add --no-cache git su-exec
+# Install git, su-exec, and bash (required by Claude Code and entrypoint)
+RUN apk add --no-cache git su-exec bash
 
 # Install Claude Code globally
 RUN npm install -g @anthropic-ai/claude-code@~2.1.0
