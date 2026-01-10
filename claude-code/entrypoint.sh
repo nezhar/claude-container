@@ -61,5 +61,5 @@ fi
 # Switch to the user and execute the command
 # Use the actual username to ensure proper environment setup
 # Set SHELL environment variable for Claude Code
-export SHELL=/bin/sh
+export SHELL=/bin/bash
 exec su-exec "${USER_NAME}" "$@"
