@@ -26,7 +26,7 @@ set -e
 
 # Version information
 # Container and proxy are always released with the same version
-VERSION="1.5.1"
+VERSION="1.5.2"
 
 # Default values
 WORKSPACE_DIR="$(pwd)"
