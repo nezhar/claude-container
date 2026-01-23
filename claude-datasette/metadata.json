@@ -58,7 +58,16 @@
         "settings": {
           "allow_fullscreen": true
         },
-        "filters": {},
+        "filters": {
+          "date_start": {
+            "name": "Start Date",
+            "type": "date"
+          },
+          "date_end": {
+            "name": "End Date",
+            "type": "date"
+          }
+        },
         "layout": [
           ["total-requests", "success-rate", "avg-response-time", "avg-response-time"],
           ["total-input-tokens", "total-cache-creation-tokens", "total-cache-read-tokens", "total-output-tokens"],
@@ -71,7 +80,7 @@
           "total-requests": {
             "title": "Total Requests",
             "db": "requests",
-            "query": "SELECT COUNT(*) as value FROM request_logs",
+            "query": "SELECT COUNT(*) as value FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value"
@@ -80,7 +89,7 @@
           "success-rate": {
             "title": "Success Rate",
             "db": "requests",
-            "query": "SELECT ROUND(CAST(SUM(CASE WHEN response_status < 400 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) * 100, 2) as value FROM request_logs",
+            "query": "SELECT ROUND(CAST(SUM(CASE WHEN response_status < 400 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) * 100, 2) as value FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value",
@@ -90,7 +99,7 @@
           "avg-response-time": {
             "title": "Avg Response Time",
             "db": "requests",
-            "query": "SELECT ROUND(AVG(duration_ms), 2) as value FROM request_logs",
+            "query": "SELECT ROUND(AVG(duration_ms), 2) as value FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value",
@@ -100,19 +109,19 @@
           "requests-by-user-agent": {
             "title": "Requests by User Agent",
             "db": "requests",
-            "query": "SELECT json_extract(request_headers, '$.User-Agent') as user_agent, COUNT(*) as count FROM request_logs WHERE json_extract(request_headers, '$.User-Agent') IS NOT NULL GROUP BY json_extract(request_headers, '$.User-Agent') ORDER BY count DESC",
+            "query": "SELECT json_extract(request_headers, '$.User-Agent') as user_agent, COUNT(*) as count FROM request_logs WHERE json_extract(request_headers, '$.User-Agent') IS NOT NULL AND timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] GROUP BY json_extract(request_headers, '$.User-Agent') ORDER BY count DESC",
             "library": "table"
           },
           "requests-by-model": {
             "title": "Requests by Model",
             "db": "requests",
-            "query": "SELECT json_extract(request_body, '$.model') as model, COUNT(*) as count FROM request_logs WHERE json_extract(request_body, '$.model') IS NOT NULL GROUP BY json_extract(request_body, '$.model') ORDER BY count DESC",
+            "query": "SELECT json_extract(request_body, '$.model') as model, COUNT(*) as count, SUM(json_extract(response_body, '$.usage.input_tokens')) as input_tokens, SUM(json_extract(response_body, '$.usage.output_tokens')) as output_tokens, SUM(json_extract(response_body, '$.usage.cache_read_input_tokens')) as cache_read_tokens FROM request_logs WHERE response_status = 200 AND timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] GROUP BY 1 HAVING model IS NOT NULL AND model != '' ORDER BY 2 DESC",
             "library": "table"
           },
           "total-input-tokens": {
             "title": "Total Input Tokens",
             "db": "requests",
-            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "query": "SELECT SUM(json_extract(response_body, '$.usage.input_tokens')) as value FROM request_logs WHERE response_status = 200 AND timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value"
@@ -121,7 +130,7 @@
           "total-cache-creation-tokens": {
             "title": "Total Cache Creation Tokens",
             "db": "requests",
-            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.cache_creation_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.cache_creation_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "query": "SELECT SUM(json_extract(response_body, '$.usage.cache_creation_input_tokens')) as value FROM request_logs WHERE response_status = 200 AND timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value"
@@ -130,7 +139,7 @@
           "total-cache-read-tokens": {
             "title": "Total Cache Read Tokens",
             "db": "requests",
-            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.cache_read_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.cache_read_input_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "query": "SELECT SUM(json_extract(response_body, '$.usage.cache_read_input_tokens')) as value FROM request_logs WHERE response_status = 200 AND timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value"
@@ -139,16 +148,16 @@
           "total-output-tokens": {
             "title": "Total Output Tokens",
             "db": "requests",
-            "query": "SELECT SUM(tokens) as value FROM (SELECT json_extract(response_body, '$.usage.output_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'application/json%' UNION ALL SELECT json_extract(TRIM(SUBSTR(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), 7, instr(SUBSTR(response_body, instr(response_body, 'data: {\"type\":\"message_delta\"')), char(10)) - 7)), '$.usage.output_tokens') as tokens FROM request_logs WHERE response_status = 200 AND json_extract(response_headers, '$.Content-Type') LIKE 'text/event-stream%' AND instr(response_body, 'event: message_delta') > 0)",
+            "query": "SELECT SUM(json_extract(response_body, '$.usage.output_tokens')) as value FROM request_logs WHERE response_status = 200 AND timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]]",
             "library": "metric",
             "display": {
               "field": "value"
             }
           },
           "requests-timeline": {
-            "title": "Requests Over Past 24 Hours (5-min intervals)",
+            "title": "Requests Timeline",
             "db": "requests",
-            "query": "SELECT datetime(((strftime('%s', timestamp) / 300) * 300), 'unixepoch') as time, COUNT(*) as count FROM request_logs WHERE datetime(timestamp) >= datetime('now', '-24 hours') GROUP BY (strftime('%s', timestamp) / 300) ORDER BY time",
+            "query": "SELECT date(timestamp) as time, COUNT(*) as count FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] GROUP BY date(timestamp) ORDER BY time",
             "library": "vega-lite",
             "display": {
               "mark": {
@@ -160,9 +169,9 @@
                 "x": {
                   "field": "time",
                   "type": "temporal",
-                  "title": "Time",
+                  "title": "Date",
                   "axis": {
-                    "format": "%H:%M"
+                    "format": "%Y-%m-%d"
                   }
                 },
                 "y": {
@@ -176,25 +185,25 @@
           "recent-requests": {
             "title": "Recent API Requests",
             "db": "requests",
-            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs ORDER BY timestamp DESC LIMIT 20",
+            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] ORDER BY timestamp DESC LIMIT 20",
             "library": "table"
           },
           "requests-by-status": {
             "title": "Requests by Status Code",
             "db": "requests",
-            "query": "SELECT response_status, json_extract(response_headers, '$.Content-Type') as content_type, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_duration_ms FROM request_logs GROUP BY response_status, json_extract(response_headers, '$.Content-Type') ORDER BY count DESC",
+            "query": "SELECT response_status, json_extract(response_headers, '$.Content-Type') as content_type, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_duration_ms FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] GROUP BY response_status, json_extract(response_headers, '$.Content-Type') ORDER BY count DESC",
             "library": "table"
           },
           "requests-by-path": {
             "title": "Requests by Path",
             "db": "requests",
-            "query": "SELECT path, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_duration_ms FROM request_logs GROUP BY path ORDER BY count DESC",
+            "query": "SELECT path, COUNT(*) as count, ROUND(AVG(duration_ms), 2) as avg_duration_ms FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] GROUP BY path ORDER BY count DESC",
             "library": "table"
           },
           "slowest-requests": {
             "title": "Slowest Requests",
             "db": "requests",
-            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs ORDER BY duration_ms DESC LIMIT 10",
+            "query": "SELECT timestamp, method, path, response_status, ROUND(duration_ms, 2) as duration_ms FROM request_logs WHERE timestamp >= COALESCE(NULLIF(:date_start, ''), date('now', '-7 days')) [[ AND timestamp < date(:date_end, '+1 day') ]] ORDER BY duration_ms DESC LIMIT 10",
             "library": "table"
           }
         }

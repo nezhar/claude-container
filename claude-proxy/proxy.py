@@ -21,6 +21,93 @@ TARGET_API_URL = os.getenv("TARGET_API_URL", "https://api.anthropic.com")
 DB_PATH = os.getenv("DB_PATH", "/data/requests.db")
 
 
+def compact_streaming_response(raw_body: str) -> str:
+    """
+    Compact a Server-Sent Events (SSE) streaming response into a single JSON response.
+
+    SSE responses from Claude API contain multiple 'data:' lines, each with a JSON chunk.
+    This function consolidates them into a single response object, significantly reducing
+    storage size while preserving all essential information.
+
+    Args:
+        raw_body: The raw SSE response body with multiple data: lines
+
+    Returns:
+        A compacted JSON string, or the original body if not a streaming response
+    """
+    if not raw_body or not raw_body.strip().startswith("event:"):
+        return raw_body
+
+    chunks = []
+    content_parts = []
+    metadata = {}
+    usage = {}
+    finish_reason = None
+
+    for line in raw_body.split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        data_str = line[5:].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+
+        try:
+            chunk = json.loads(data_str)
+            chunks.append(chunk)
+
+            # Extract metadata from first chunk
+            if not metadata and chunk.get("type") == "message_start":
+                msg = chunk.get("message", {})
+                metadata = {
+                    "id": msg.get("id"),
+                    "type": "message",
+                    "role": msg.get("role"),
+                    "model": msg.get("model"),
+                    "stop_reason": msg.get("stop_reason"),
+                    "stop_sequence": msg.get("stop_sequence"),
+                }
+                if msg.get("usage"):
+                    usage = msg.get("usage", {})
+
+            # Extract content from content_block_delta events
+            if chunk.get("type") == "content_block_delta":
+                delta = chunk.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    content_parts.append(delta.get("text", ""))
+                elif delta.get("type") == "thinking_delta":
+                    content_parts.append(delta.get("thinking", ""))
+
+            # Extract finish reason and final usage from message_delta
+            if chunk.get("type") == "message_delta":
+                delta = chunk.get("delta", {})
+                if delta.get("stop_reason"):
+                    finish_reason = delta.get("stop_reason")
+                    metadata["stop_reason"] = finish_reason
+                if chunk.get("usage"):
+                    usage.update(chunk.get("usage", {}))
+
+        except json.JSONDecodeError:
+            continue
+
+    if not chunks:
+        return raw_body
+
+    # Build compacted response
+    compacted = {
+        **metadata,
+        "content": [{"type": "text", "text": "".join(content_parts)}],
+        "usage": usage,
+        "_compacted": {
+            "original_chunks": len(chunks),
+            "compacted_at": datetime.utcnow().isoformat()
+        }
+    }
+
+    return json.dumps(compacted)
+
+
 class ProxyLogger:
     """Handles SQLite logging of requests and responses."""
 
@@ -28,9 +115,9 @@ class ProxyLogger:
         self.db_path = db_path
 
     async def run_migrations(self, db):
-        """Run all SQL migration files in order."""
+        """Run all migration files (SQL and Python) in order."""
         import pathlib
-        import glob
+        import importlib.util
 
         migrations_dir = pathlib.Path(__file__).parent / "migrations"
         if not migrations_dir.exists():
@@ -66,8 +153,10 @@ class ProxyLogger:
             await db.commit()
             applied.add("000_initial.sql")
 
-        # Find and sort migration files
-        migration_files = sorted(migrations_dir.glob("*.sql"))
+        # Find and sort all migration files (both .sql and .py)
+        sql_files = list(migrations_dir.glob("*.sql"))
+        py_files = list(migrations_dir.glob("*.py"))
+        migration_files = sorted(sql_files + py_files, key=lambda f: f.name)
 
         for migration_file in migration_files:
             filename = migration_file.name
@@ -79,9 +168,22 @@ class ProxyLogger:
 
             print(f"  → Applying migration {filename}...")
             try:
-                sql_content = migration_file.read_text()
-                # Execute the migration (split by semicolon for multiple statements)
-                await db.executescript(sql_content)
+                if filename.endswith(".sql"):
+                    # SQL migration
+                    sql_content = migration_file.read_text()
+                    await db.executescript(sql_content)
+                elif filename.endswith(".py"):
+                    # Python migration - must have an async migrate(db) function
+                    spec = importlib.util.spec_from_file_location(
+                        filename[:-3], migration_file
+                    )
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    if hasattr(module, "migrate"):
+                        await module.migrate(db)
+                    else:
+                        print(f"  ⚠ Migration {filename} has no migrate() function, skipping")
+                        continue
 
                 # Record the migration as applied
                 await db.execute(
@@ -227,6 +329,9 @@ async def proxy_handler(request: web.Request) -> web.Response:
                 # Log to database (convert body to text for logging)
                 try:
                     response_body_text = response_body.decode('utf-8')
+                    # Compact streaming responses to reduce database size
+                    if response_body_text.strip().startswith("event:"):
+                        response_body_text = compact_streaming_response(response_body_text)
                 except:
                     response_body_text = f"<binary data, {len(response_body)} bytes>"
 
