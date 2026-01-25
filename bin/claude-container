@@ -43,6 +43,7 @@ NETWORK_NAME="claude-network"
 PROXY_CONTAINER_NAME="claude-proxy"
 DATASETTE_CONTAINER_NAME="claude-datasette"
 DATASETTE_PORT=8001
+SHELL_MODE=false
 
 # Color codes for output
 RED='\033[0;31m'
@@ -67,6 +68,7 @@ OPTIONS:
     -h, --help                  Show this help message
     -v, --version               Show version information (Claude Container, Claude Code, Docker)
     --pull                      Pull latest images before running
+    --shell                     Drop into container shell instead of starting Claude
 
 PROXY OPTIONS:
     --proxy                     Enable API logging proxy
@@ -92,6 +94,7 @@ EXAMPLES:
     claude-container --datasette-logs               # View Datasette logs
     claude-container -w /path/to/project            # Run with custom workspace
     claude-container --pull                         # Pull latest images and run
+    claude-container --shell                        # Access container shell before starting Claude
     claude-container ls -la                         # Run custom command in container
 
 ENVIRONMENT VARIABLES:
@@ -309,6 +312,10 @@ while [[ $# -gt 0 ]]; do
             PULL_IMAGES=true
             shift
             ;;
+        --shell)
+            SHELL_MODE=true
+            shift
+            ;;
         -v|--version)
             echo -e "${GREEN}Claude Container Version Information${NC}"
             echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -345,6 +352,11 @@ PROXY_DATA_DIR="${CLAUDE_PROXY_DATA:-$PROXY_DATA_DIR}"
 IMAGE="${CLAUDE_IMAGE:-$IMAGE}"
 PROXY_IMAGE="${CLAUDE_PROXY_IMAGE:-$PROXY_IMAGE}"
 DATASETTE_IMAGE="${CLAUDE_DATASETTE_IMAGE:-$DATASETTE_IMAGE}"
+
+# Handle shell mode - override command to drop into shell
+if [ "$SHELL_MODE" = true ]; then
+    COMMAND="/bin/sh"
+fi
 
 # Handle datasette-only command
 if [ "$DATASETTE_ONLY" = true ]; then
