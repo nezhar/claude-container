@@ -3,7 +3,7 @@ name: Build and Push Docker Images
 on:
   push:
     tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
+      - '*.*.*'
 
 jobs:
   build-and-push:
@@ -12,9 +12,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract version from tag
+      - name: Extract and validate version
         id: version
-        run: echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid SemVer tag (expected format: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Login to DockerHub
         uses: docker/login-action@v3
