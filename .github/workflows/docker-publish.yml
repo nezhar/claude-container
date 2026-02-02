@@ -1,0 +1,67 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+jobs:
+  build-and-push:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract and validate version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid SemVer tag (expected format: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push claude-container
+        uses: docker/build-push-action@v6
+        with:
+          context: claude-code
+          push: true
+          no-cache: true
+          platforms: linux/amd64
+          tags: |
+            nezhar/claude-container:${{ steps.version.outputs.version }}
+            nezhar/claude-container:latest
+
+      - name: Build and push claude-proxy
+        uses: docker/build-push-action@v6
+        with:
+          context: claude-proxy
+          push: true
+          no-cache: true
+          platforms: linux/amd64
+          tags: |
+            nezhar/claude-proxy:${{ steps.version.outputs.version }}
+            nezhar/claude-proxy:latest
+
+      - name: Build and push claude-datasette
+        uses: docker/build-push-action@v6
+        with:
+          context: claude-datasette
+          push: true
+          no-cache: true
+          platforms: linux/amd64
+          tags: |
+            nezhar/claude-datasette:${{ steps.version.outputs.version }}
+            nezhar/claude-datasette:latest
