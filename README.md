@@ -1,5 +1,7 @@
 # Claude Container
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/nezhar/claude-container)
+
 A Docker container with Claude Code pre-installed and ready to use.
 
 This container includes all necessary dependencies and provides an easy way to run Claude Code in an isolated environment.
@@ -142,6 +144,78 @@ docker run --rm -it -v "$(pwd):/workspace" -v "$HOME/.config/claude-container:/c
 ```
 
 This will store the credentials in `$HOME/.config/claude-container` and will be able to reuse them after the first login.
+
+### Using VS Code Dev Containers or GitHub Codespaces (Zero Setup)
+
+The easiest way to get started with Claude Container is using VS Code Dev Containers or GitHub Codespaces - no local Docker installation required for Codespaces!
+
+#### GitHub Codespaces (Cloud-Based, Instant Setup)
+
+1. **Launch a Codespace**: Click the "Code" button on the GitHub repository page, select "Codespaces", and click "Create codespace on main"
+2. **Wait for Setup**: The container will automatically build and start (usually takes 1-2 minutes)
+3. **Run Claude Code**: Open the terminal in VS Code and run:
+   ```bash
+   claude
+   ```
+4. **Authenticate**: Follow the authentication prompts (see [How does the authentication work](#how-does-the-authentication-work) section below)
+
+Your configuration will persist across Codespace sessions using a Docker volume.
+
+#### VS Code Dev Containers (Local)
+
+If you prefer to work locally with VS Code:
+
+1. **Prerequisites**: 
+   - Install [VS Code](https://code.visualstudio.com/)
+   - Install the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
+   - Install [Docker Desktop](https://www.docker.com/products/docker-desktop)
+
+2. **Open in Container**:
+   - Clone this repository
+   - Open the folder in VS Code
+   - When prompted, click "Reopen in Container" (or run "Dev Containers: Reopen in Container" from the command palette)
+
+3. **Run Claude Code**:
+   ```bash
+   claude
+   ```
+
+4. **Authenticate**: Follow the authentication prompts (see [How does the authentication work](#how-does-the-authentication-work) section below)
+
+#### Devcontainer Benefits
+
+- ✅ **Zero Configuration**: Everything is pre-configured and ready to use
+- ✅ **Consistent Environment**: Everyone uses the same development environment
+- ✅ **Persistent Config**: Your authentication persists between container rebuilds
+- ✅ **Cloud or Local**: Works with both GitHub Codespaces and local VS Code
+- ✅ **Instant Access**: Try Claude Code without installing anything locally (using Codespaces)
+
+#### Troubleshooting Devcontainers
+
+**Authentication not persisting between rebuilds:**
+- The devcontainer uses a named Docker volume `claude-container-config` to persist your configuration
+- If you need to reset authentication, you can delete this volume:
+  ```bash
+  docker volume rm claude-container-config
+  ```
+
+**Port forwarding issues in Codespaces:**
+- Claude Code doesn't require any port forwarding by default
+- If you're using the proxy features, ports will be automatically forwarded
+
+**Permission errors:**
+- The container runs as the `node` user (UID 1000) by default
+- If you encounter permission issues, ensure the workspace folder has appropriate permissions
+
+**Container fails to build:**
+- Check your internet connection (container needs to pull the image)
+- Try rebuilding: Run "Dev Containers: Rebuild Container" from the VS Code command palette
+- For Codespaces, delete and recreate the Codespace if issues persist
+
+**Codespaces-specific considerations:**
+- Free tier has usage limits (60 hours/month for free accounts)
+- Your workspace files persist in the Codespace, but Docker volumes are separate
+- Codespaces automatically suspends after 30 minutes of inactivity
 
 ## How does the authentication work
 
