@@ -39,7 +39,7 @@ jobs:
           context: claude-code
           push: true
           no-cache: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: |
             nezhar/claude-container:${{ steps.version.outputs.version }}
             nezhar/claude-container:latest
@@ -50,7 +50,7 @@ jobs:
           context: claude-proxy
           push: true
           no-cache: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: |
             nezhar/claude-proxy:${{ steps.version.outputs.version }}
             nezhar/claude-proxy:latest
@@ -61,7 +61,7 @@ jobs:
           context: claude-datasette
           push: true
           no-cache: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: |
             nezhar/claude-datasette:${{ steps.version.outputs.version }}
             nezhar/claude-datasette:latest
