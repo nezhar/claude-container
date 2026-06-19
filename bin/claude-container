@@ -36,7 +36,11 @@ PROXY_DATA_DIR="$HOME/.config/claude-container/proxy-data"
 IMAGE="nezhar/claude-container:${VERSION}"
 PROXY_IMAGE="nezhar/claude-proxy:${VERSION}"
 DATASETTE_IMAGE="nezhar/claude-datasette:${VERSION}"
-COMMAND="claude"
+# Default command: launch Claude Code with permission prompts disabled. The
+# container is an isolated sandbox (workspace + config bind-mounts only), so the
+# interactive approval flow just gets in the way here. Passing an explicit
+# command (e.g. `claude-container claude --resume` or `--shell`) overrides this.
+COMMAND="claude --dangerously-skip-permissions"
 USE_PROXY=false
 USE_DATASETTE=false
 NETWORK_NAME="claude-network"
@@ -84,7 +88,7 @@ DATASETTE OPTIONS:
     --datasette-logs            Show Datasette container logs
 
 EXAMPLES:
-    claude-container                                # Run in current directory
+    claude-container                                # Run claude --dangerously-skip-permissions in current dir
     claude-container --proxy                        # Run with API logging enabled
     claude-container --proxy --datasette            # Run with logging and data visualization
     claude-container --datasette-only               # Start only Datasette (if database exists)
