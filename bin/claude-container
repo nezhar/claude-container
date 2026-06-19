@@ -119,6 +119,12 @@ FIRST TIME SETUP:
     On first run, you'll be prompted to authenticate with Claude.
     Your credentials will be stored in the config directory for future use.
 
+WORKSPACE OVERLAY:
+    If the workspace contains a .claude-container-overlay file, it is appended
+    as a Dockerfile fragment to the base image and a workspace-local image is
+    built (tagged claude-container-overlay:<hash>). Use this to persist tools
+    like apt packages, Nix, or global CLIs across container launches.
+
 EOF
 }
 
@@ -445,6 +451,39 @@ fi
 # Convert paths to absolute paths
 WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
 CONFIG_DIR="$(cd "$CONFIG_DIR" && pwd)" 2>/dev/null || CONFIG_DIR="$(mkdir -p "$CONFIG_DIR" && cd "$CONFIG_DIR" && pwd)"
+
+# Overlay support: if the workspace contains .claude-container-overlay, build a
+# workspace-local image whose Dockerfile is `FROM $IMAGE` followed by the
+# overlay's contents, and use that instead of the base image. The overlay image
+# is tagged with a content hash of (base image + overlay file) so switching
+# branches that have different overlays just switches images.
+OVERLAY_FILE="$WORKSPACE_DIR/.claude-container-overlay"
+if [ -f "$OVERLAY_FILE" ]; then
+    # Hash base image tag + overlay contents -> image tag.
+    if command -v shasum >/dev/null 2>&1; then
+        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE"; cat "$OVERLAY_FILE"; } | shasum -a 256 | cut -c1-12)
+    else
+        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE"; cat "$OVERLAY_FILE"; } | sha256sum | cut -c1-12)
+    fi
+    OVERLAY_IMAGE="claude-container-overlay:${OVERLAY_HASH}"
+
+    if ! docker image inspect "$OVERLAY_IMAGE" >/dev/null 2>&1; then
+        echo -e "${GREEN}Building overlay image ${OVERLAY_IMAGE} from ${IMAGE}...${NC}"
+        BUILD_DIR="$(mktemp -d)"
+        trap 'rm -rf "$BUILD_DIR"' EXIT
+        {
+            printf 'FROM %s\n' "$IMAGE"
+            cat "$OVERLAY_FILE"
+        } > "$BUILD_DIR/Dockerfile"
+        if ! docker build -t "$OVERLAY_IMAGE" "$BUILD_DIR"; then
+            echo -e "${RED}Error: Failed to build overlay image${NC}"
+            exit 1
+        fi
+        rm -rf "$BUILD_DIR"
+        trap - EXIT
+    fi
+    IMAGE="$OVERLAY_IMAGE"
+fi
 
 # Handle proxy mode
 if [ "$USE_PROXY" = true ]; then
