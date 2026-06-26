@@ -125,6 +125,55 @@ claude-container --version
 
 The helper script will automatically pull the latest Docker images when needed.
 
+### Workspace Overlay
+
+The base `claude-container` image is shared across all workspaces. To layer
+project-specific tooling on top of it **persistently**, drop a
+`.claude-container-overlay` file at your workspace root. It is a Dockerfile
+fragment that the launcher appends to the base image, building a workspace-local
+image tagged `claude-container-overlay:<hash>` (content-addressed over the base
+image tag plus the overlay contents). Switching branches with different overlays
+just switches images — no rebuild if you've used that overlay before.
+
+```dockerfile
+# .claude-container-overlay
+# 2026-06-25: ffmpeg for the video pipeline tests
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+#### Port Forwarding
+
+The overlay can also publish container ports to the host (for a dev server, web
+UI, debugger, etc.). Add directive comments anywhere in the overlay file:
+
+```dockerfile
+# claude-container:port 8080:8080
+# claude-container:port 127.0.0.1:3000:3000
+# claude-container:port 9000:9000/udp
+```
+
+Everything after `claude-container:port` is passed straight to `docker run -p`,
+so any value Docker accepts works (`host:container`, `ip:host:container`, a bare
+container port, or a `/udp` suffix). These are plain Dockerfile comments, so they
+don't affect the build — the launcher reads them and adds the `-p` flags when it
+starts the container.
+
+#### Provisioning the Overlay Skill
+
+To teach Claude in a project how to use the overlay (so it can persist tools it
+installs and declare port mappings on your behalf), install the bundled
+`container-overlay` skill into the workspace:
+
+```bash
+claude-container --provision-overlay            # current directory
+claude-container --provision-overlay -w /path   # specific workspace
+```
+
+This writes `.claude/skills/container-overlay/SKILL.md` into the workspace. It
+won't overwrite an existing copy — delete the file first to re-provision.
+
 ### Using Docker Compose
 
 Create a `compose.yml` file as provided in the example folder. 
