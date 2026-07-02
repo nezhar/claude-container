@@ -22,7 +22,7 @@ _claude_container_completion() {
         --datasette-logs
         --pull
         --shell
-        --provision-overlay
+        --tmux
         --version -v
         --help -h
     "
@@ -34,7 +34,7 @@ _claude_container_completion() {
     local port_flags="--datasette-port"
 
     # Flags that don't take arguments (actions)
-    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --pull --shell --provision-overlay --version -v --help -h"
+    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --pull --shell --tmux --version -v --help -h"
 
     case "$prev" in
         --workspace|-w|--config|-c|--proxy-data)

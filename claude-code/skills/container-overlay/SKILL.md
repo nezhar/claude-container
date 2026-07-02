@@ -52,9 +52,10 @@ mappings with directive comments anywhere in the overlay file:
 
 Everything after `claude-container:port` is passed straight to `docker run -p`, so
 any value docker accepts works: `host:container`, `ip:host:container`, a bare
-container port, or a `/udp` suffix. These are plain Dockerfile comments, so they
-don't affect the build — the launcher reads them and adds the `-p` flags when it
-starts the container. Pair the port directive with whatever installs/starts the
+container port, or a `/udp` suffix. The launcher strips these directives out
+before hashing/building the overlay image, so **adding, changing, or removing a
+port mapping never triggers an image rebuild** — it only changes the `-p` flags on
+the next `docker run`. Pair the port directive with whatever installs/starts the
 service (e.g. a `RUN` that installs it) so the mapping and the server stay together.
 
 ## Append, don't rewrite

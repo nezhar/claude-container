@@ -160,19 +160,57 @@ container port, or a `/udp` suffix). These are plain Dockerfile comments, so the
 don't affect the build — the launcher reads them and adds the `-p` flags when it
 starts the container.
 
-#### Provisioning the Overlay Skill
+### Permissions
 
-To teach Claude in a project how to use the overlay (so it can persist tools it
-installs and declare port mappings on your behalf), install the bundled
-`container-overlay` skill into the workspace:
+The container is an isolated sandbox (only the workspace and config dir are
+bind-mounted), so Claude's interactive permission prompts just get in the way. The
+launcher disables them on every run by ensuring the config dir's `settings.json`
+contains:
 
-```bash
-claude-container --provision-overlay            # current directory
-claude-container --provision-overlay -w /path   # specific workspace
+```json
+{ "permissions": { "defaultMode": "bypassPermissions" } }
 ```
 
-This writes `.claude/skills/container-overlay/SKILL.md` into the workspace. It
-won't overwrite an existing copy — delete the file first to re-provision.
+This setting (merged into any existing `settings.json`, preserving your other
+keys) applies to **every** `claude` launch in the container — including explicit
+ones like `claude-container claude --resume`. It is used instead of the
+`--dangerously-skip-permissions` flag, whose interactive acceptance screen stopped
+persisting in recent Claude Code versions and would silently fall back to
+prompting. To re-enable prompts, remove that key from
+`~/.config/claude-container/config/settings.json`.
+
+### Bundled Skills
+
+The image ships with Claude Code [skills](https://code.claude.com/docs/en/skills)
+baked in (under `claude-code/skills/`) so Claude knows how to use the
+container-specific features in **every** workspace, with no per-project setup:
+
+- **`container-overlay`** — how to persist tooling and declare port mappings via
+  `.claude-container-overlay`.
+- **`container-tmux`** — how to drive the tmux session when running with `--tmux`
+  (see below).
+
+The skills are copied into Claude's skills directory automatically when the
+container starts (the entrypoint deploys them from `/opt/claude-container/skills`,
+refreshed on each launch so they always match the image version). To add or edit
+a bundled skill, change the files under `claude-code/skills/` and rebuild the
+image.
+
+### Running Inside tmux
+
+Pass `--tmux` to run Claude inside a [tmux](https://github.com/tmux/tmux) session:
+
+```bash
+claude-container --tmux
+```
+
+This lets you open additional shells in the same container (with your tmux
+prefix, e.g. `prefix + c`) and run commands directly — without going through
+Claude — and lets Claude start and observe long-running processes in their own
+windows via `tmux` / `tmux send-keys`. The top-level session has the canonical
+name **`claude`**, and the host's `~/.tmux.conf` is mounted in when present (so
+your keybindings and prefix carry over). The bundled `container-tmux` skill
+documents the workflow for Claude.
 
 ### Using Docker Compose
 

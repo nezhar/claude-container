@@ -1,0 +1,34 @@
+#!/bin/bash
+#
+# Launch Claude Code inside a named tmux session.
+#
+# Used by `claude-container --tmux`. Running Claude inside tmux lets the user open
+# additional shells in the same container (their tmux prefix + c) without going
+# through Claude, and lets Claude drive/observe extra windows via `tmux` and
+# `tmux send-keys`. The session name is canonical so those commands have a stable
+# target — see the container-tmux skill.
+#
+# Configuration (all optional, set by the launcher):
+#   CLAUDE_TMUX_SESSION   session name           (default: claude)
+#   CLAUDE_TMUX_WINDOW    first window name       (default: claude)
+#   CLAUDE_TMUX_COMMAND   command run in window 0 (default: claude)
+# The host's ~/.tmux.conf, when present, is mounted at /etc/claude-container/tmux.conf.
+
+set -e
+
+SESSION="${CLAUDE_TMUX_SESSION:-claude}"
+WINDOW="${CLAUDE_TMUX_WINDOW:-claude}"
+CLAUDE_CMD="${CLAUDE_TMUX_COMMAND:-claude}"
+
+TMUX_ARGS=()
+if [ -f /etc/claude-container/tmux.conf ]; then
+    TMUX_ARGS+=(-f /etc/claude-container/tmux.conf)
+fi
+
+# Reattach if a session somehow already exists (e.g. a restarted container that
+# kept its tmux server); otherwise create it and run Claude in the first window.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux "${TMUX_ARGS[@]}" attach-session -t "$SESSION"
+fi
+
+exec tmux "${TMUX_ARGS[@]}" new-session -s "$SESSION" -n "$WINDOW" "$CLAUDE_CMD"
