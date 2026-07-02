@@ -19,12 +19,17 @@ a tmux-enabled container.
 ## The canonical session
 
 - **Session name: `claude`** (stable — always target this name).
-- Claude itself runs in window `claude` (window index `0`) of that session.
+- Claude itself runs in window `agent` (window index `0`) of that session.
 - The host's `~/.tmux.conf` is mounted in (when present), so the user's keybinds,
   prefix, and status line are the ones they're used to.
 
 Because the name is fixed, you can address any window deterministically as
 `claude:<window>` (e.g. `claude:1`) or a specific pane as `claude:<window>.<pane>`.
+
+Don't name a window `claude` (or anything starting with `claude`): tmux resolves a
+`-t claude` target to a matching **window** before the session, so a window called
+`claude` would shadow the session and break `tmux new-window -t claude`. That's why
+the first window is `agent`, not `claude`.
 
 ## What the user can do without you
 
@@ -92,7 +97,7 @@ tmux kill-window -t claude:devserver
   `Enter` key name. Likewise use key names like `C-c`, `C-d`, `Tab`, `Escape`.
 - Quote literal strings you send so the shell here doesn't expand them before tmux
   sees them.
-- Don't kill the `claude` window (index 0) — that's the session Claude (you) runs
-  in; killing it tears down your own process and the container exits.
+- Don't kill the `agent` window (`claude:0`) — that's where Claude (you) runs;
+  killing it tears down your own process and the container exits.
 - Output only appears in `capture-pane` after the process writes it. For slow
   commands, capture again after a short wait rather than assuming no output.

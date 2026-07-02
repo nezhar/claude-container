@@ -10,14 +10,17 @@
 #
 # Configuration (all optional, set by the launcher):
 #   CLAUDE_TMUX_SESSION   session name           (default: claude)
-#   CLAUDE_TMUX_WINDOW    first window name       (default: claude)
+#   CLAUDE_TMUX_WINDOW    first window name       (default: agent)
 #   CLAUDE_TMUX_COMMAND   command run in window 0 (default: claude)
+# The first window is named distinctly from the session (not "claude") so that
+# `tmux new-window -t claude` unambiguously targets the session — a window sharing
+# the session's name would shadow it (tmux matches the window first).
 # The host's ~/.tmux.conf, when present, is mounted at /etc/claude-container/tmux.conf.
 
 set -e
 
 SESSION="${CLAUDE_TMUX_SESSION:-claude}"
-WINDOW="${CLAUDE_TMUX_WINDOW:-claude}"
+WINDOW="${CLAUDE_TMUX_WINDOW:-agent}"
 CLAUDE_CMD="${CLAUDE_TMUX_COMMAND:-claude}"
 
 TMUX_ARGS=()
