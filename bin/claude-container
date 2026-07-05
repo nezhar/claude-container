@@ -57,6 +57,17 @@ TMUX_MODE=false
 PORT_ARGS=()
 # Extra docker run args assembled at launch time (e.g. tmux mount + env)
 EXTRA_DOCKER_ARGS=()
+# Skill sharing: agents inside the container propose skills into the workspace's
+# .claude-container-skills/; skills adopted user-wide live in USER_SKILLS_DIR and
+# are offered to every project; per-project accept/reject choices are sticky and
+# live in SKILL_CHOICES_DIR (one file per workspace).
+USER_SKILLS_DIR="$CONFIG_BASE_DIR/user-skills"
+SKILL_CHOICES_DIR="$CONFIG_BASE_DIR/skill-choices"
+# Names reserved by the image's baked-in skills (the entrypoint re-deploys these
+# on every container start, so managed skills must not collide with them).
+BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills"
+SKILLS_ACTION=""
+SKILLS_NAME=""
 
 # Color codes for output
 RED='\033[0;31m'
@@ -98,6 +109,14 @@ DATASETTE OPTIONS:
     --datasette-stop            Stop and cleanup Datasette container
     --datasette-logs            Show Datasette container logs
 
+SKILLS OPTIONS:
+    --skills                    List user-wide + workspace skills and this project's choices
+    --skills-adopt <name>       Copy a workspace skill into the user-wide set
+    --skills-accept <name>      Include a user-wide skill in this project (sticky)
+    --skills-reject <name>      Exclude a user-wide skill from this project (sticky)
+    --skills-reset              Forget this project's choices (prompt again next launch)
+    --skills-drop <name>        Remove a skill from the user-wide set
+
 EXAMPLES:
     claude-container                                # Run Claude (permission prompts disabled) in current dir
     claude-container --proxy                        # Run with API logging enabled
@@ -111,6 +130,8 @@ EXAMPLES:
     claude-container --pull                         # Pull latest images and run
     claude-container --shell                        # Access container shell before starting Claude
     claude-container --tmux                         # Run Claude inside a tmux session
+    claude-container --skills                       # List skills and this project's choices
+    claude-container --skills-adopt my-skill        # Share a workspace skill with all projects
     claude-container ls -la                         # Run custom command in container
 
 ENVIRONMENT VARIABLES:
@@ -136,26 +157,47 @@ FIRST TIME SETUP:
     Your credentials will be stored in the config directory for future use.
 
 WORKSPACE OVERLAY:
-    If the workspace contains a .claude-container-overlay file, it is appended
-    as a Dockerfile fragment to the base image and a workspace-local image is
-    built (tagged claude-container-overlay:<hash>). Use this to persist tools
-    like apt packages, Nix, or global CLIs across container launches.
+    A .claude-container-overlay/ directory at the workspace root layers
+    project-specific state on top of the shared base image:
 
-    The overlay may also declare port mappings to publish when the container
-    starts, using directive comments of the form:
+        .claude-container-overlay/
+        ├── Dockerfile      Build fragment appended to the base image (the
+        │                   overlay directory is the build context, so COPY
+        │                   of files in it works). Use this to persist tools
+        │                   like apt packages, Nix, or global CLIs.
+        ├── overlay.json    Structured runtime config. Currently supported:
+        │                   {"ports": ["8080:8080", "127.0.0.1:3000:3000"]}
+        │                   Each entry is passed straight to "docker run -p".
+        └── skills/<name>/  Skills proposed by Claude from inside the container
+                            (deployed at launch, never baked into the image).
 
-        # claude-container:port 8080:8080
-        # claude-container:port 127.0.0.1:3000:3000
-        # claude-container:port 9000:9000/udp
+    The built image is tagged claude-container-overlay:<hash> over the base
+    image plus the build inputs; overlay.json and skills/ are excluded from the
+    hash, so port/skill changes never trigger a rebuild.
 
-    Each <mapping> is passed straight to "docker run -p", so any value docker
-    accepts works (host:container, ip:host:container, .../udp, or a bare port).
+    The legacy form — a single .claude-container-overlay Dockerfile-fragment
+    file with "# claude-container:port <mapping>" directive comments — is still
+    supported.
 
 BUNDLED SKILLS:
     The image ships with Claude Code skills baked in (container-overlay,
-    container-tmux). They are deployed into the skills directory automatically on
-    container start, so Claude knows how to use the overlay and tmux features in
-    every workspace — no per-project setup required.
+    container-tmux, container-skills). They are deployed into the skills
+    directory automatically on container start, so Claude knows how to use the
+    overlay, tmux, and skill-sharing features in every workspace — no
+    per-project setup required.
+
+SKILL SHARING:
+    Claude can propose new skills from inside the container by writing them to
+    <workspace>/.claude-container-overlay/skills/<name>/SKILL.md (the bundled
+    container-skills skill teaches it how). Workspace skills are always deployed
+    for their own project at launch.
+
+    Adopt one into the user-wide set (~/.config/claude-container/user-skills)
+    with --skills-adopt to offer it to every claude-container project: each
+    project is prompted once at launch to accept or reject it, and the answer is
+    sticky (stored under ~/.config/claude-container/skill-choices). Use --skills
+    to review, and --skills-accept/--skills-reject/--skills-reset to manage a
+    project's choices.
 
 TMUX SESSION (--tmux):
     With --tmux, Claude runs inside a tmux session named "claude" and the host's
@@ -207,6 +249,368 @@ PY
         echo -e "${YELLOW}Warning: python3 not found; cannot merge bypassPermissions into $settings.${NC}"
         echo -e "${YELLOW}Add '\"permissions\": {\"defaultMode\": \"bypassPermissions\"}' to it to disable prompts.${NC}"
     fi
+}
+
+# --- Skill sharing ------------------------------------------------------------
+#
+# Skills flow through three tiers:
+#
+#   1. Workspace skills    <workspace>/.claude-container-overlay/skills/<name>/
+#      Proposed by Claude from inside the container (see the bundled
+#      container-skills skill). Always deployed for their own project.
+#   2. User-wide skills    $USER_SKILLS_DIR/<name>/
+#      Adopted from a workspace with --skills-adopt; offered to every project.
+#   3. Per-project choices  $SKILL_CHOICES_DIR/<project-key>.conf
+#      Records accept/reject per user-wide skill, per workspace. An undecided
+#      skill prompts once at launch; y/n answers are sticky, skip asks again.
+#
+# Before each run the effective set (workspace skills + accepted user-wide
+# skills) is synced into $CONFIG_DIR/skills. A manifest file records which
+# entries the launcher manages, so rejected/dropped skills are cleaned up
+# without touching skills the user placed there by hand or the image-bundled
+# ones (the entrypoint re-deploys those on every container start).
+
+sha256_12() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -c1-12
+    else
+        sha256sum | cut -c1-12
+    fi
+}
+
+# Stable per-workspace identity for the choices file: readable basename + path hash.
+project_key() {
+    local hash
+    hash=$(printf '%s' "$WORKSPACE_DIR" | sha256_12)
+    printf '%s-%s\n' "$(basename "$WORKSPACE_DIR" | tr -c 'a-zA-Z0-9_.-' '-' | sed 's/-*$//')" "$hash"
+}
+
+choices_file() {
+    printf '%s/%s.conf\n' "$SKILL_CHOICES_DIR" "$(project_key)"
+}
+
+valid_skill_name() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+is_bundled_skill() {
+    local n
+    for n in $BUNDLED_SKILL_NAMES; do
+        if [ "$1" = "$n" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Subdirectories of $1 that contain a SKILL.md, one name per line.
+list_skill_dirs() {
+    local d
+    if [ ! -d "$1" ]; then
+        return 0
+    fi
+    for d in "$1"/*/; do
+        if [ -f "${d}SKILL.md" ]; then
+            basename "$d"
+        fi
+    done
+    return 0
+}
+
+# First frontmatter description line of a skill, for listings and prompts.
+skill_description() {
+    sed -n 's/^description:[[:space:]]*//p' "$1/SKILL.md" 2>/dev/null | head -1 | cut -c1-100
+    return 0
+}
+
+get_skill_choice() {
+    local file
+    file="$(choices_file)"
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+    sed -n "s/^$1=//p" "$file" | tail -1
+    return 0
+}
+
+set_skill_choice() {
+    local name="$1" choice="$2" file tmp
+    file="$(choices_file)"
+    mkdir -p "$SKILL_CHOICES_DIR"
+    if [ ! -f "$file" ]; then
+        printf '# claude-container per-project skill choices\n# workspace: %s\n' "$WORKSPACE_DIR" > "$file"
+    fi
+    tmp="$file.tmp"
+    grep -v "^$name=" "$file" > "$tmp" || true
+    printf '%s=%s\n' "$name" "$choice" >> "$tmp"
+    mv "$tmp" "$file"
+}
+
+# Ask once, per project, about each user-wide skill with no recorded choice.
+# y/n answers are sticky (stored in the choices file); skip asks again next time.
+prompt_undecided_skills() {
+    local name choice desc answer
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        return 0
+    fi
+    for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
+        if ! valid_skill_name "$name" || is_bundled_skill "$name"; then
+            continue
+        fi
+        choice="$(get_skill_choice "$name")"
+        if [ -n "$choice" ]; then
+            continue
+        fi
+        desc="$(skill_description "$USER_SKILLS_DIR/$name")"
+        echo -e "${BLUE}New user-wide skill:${NC} ${YELLOW}${name}${NC}${desc:+ — $desc}"
+        while true; do
+            printf 'Include it in this project? [y]es / [n]o / [s]kip for now: '
+            read -r answer < /dev/tty || answer="s"
+            case "$answer" in
+                y|Y|yes)
+                    set_skill_choice "$name" accept
+                    break
+                    ;;
+                n|N|no)
+                    set_skill_choice "$name" reject
+                    break
+                    ;;
+                s|S|skip|"")
+                    echo -e "${BLUE}Skipped — you'll be asked again next launch.${NC}"
+                    break
+                    ;;
+                *)
+                    echo "Please answer y, n, or s."
+                    ;;
+            esac
+        done
+    done
+    return 0
+}
+
+# Sync the effective skill set for this project (workspace skills + accepted
+# user-wide skills) into the config dir's skills directory. Workspace skills win
+# name collisions with user-wide ones; bundled names are reserved.
+sync_skills() {
+    local skills_dest="$CONFIG_DIR/skills"
+    local manifest="$skills_dest/.claude-container-managed"
+    local -a names srcs
+    names=()
+    srcs=()
+    local name existing found old idx
+
+    for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR"); do
+        if ! valid_skill_name "$name"; then
+            echo -e "${YELLOW}Skipping workspace skill '$name': names must be lowercase letters, digits, and hyphens.${NC}"
+            continue
+        fi
+        if is_bundled_skill "$name"; then
+            echo -e "${YELLOW}Skipping workspace skill '$name': the name is reserved by an image-bundled skill.${NC}"
+            continue
+        fi
+        names+=("$name")
+        srcs+=("$WORKSPACE_SKILLS_DIR/$name")
+    done
+
+    for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
+        if ! valid_skill_name "$name" || is_bundled_skill "$name"; then
+            continue
+        fi
+        if [ "$(get_skill_choice "$name")" != "accept" ]; then
+            continue
+        fi
+        found=false
+        for existing in "${names[@]}"; do
+            if [ "$existing" = "$name" ]; then
+                found=true
+            fi
+        done
+        if [ "$found" = true ]; then
+            continue  # workspace copy wins the collision
+        fi
+        names+=("$name")
+        srcs+=("$USER_SKILLS_DIR/$name")
+    done
+
+    # Nothing to manage and nothing managed before: leave the dir untouched.
+    if [ ${#names[@]} -eq 0 ] && [ ! -f "$manifest" ]; then
+        return 0
+    fi
+
+    mkdir -p "$skills_dest"
+
+    # Remove previously managed skills that fell out of the set (rejected,
+    # dropped user-wide, or deleted from the workspace).
+    if [ -f "$manifest" ]; then
+        while IFS= read -r old; do
+            if [ -z "$old" ] || ! valid_skill_name "$old"; then
+                continue
+            fi
+            found=false
+            for existing in "${names[@]}"; do
+                if [ "$existing" = "$old" ]; then
+                    found=true
+                fi
+            done
+            if [ "$found" = false ]; then
+                rm -rf "$skills_dest/${old:?}"
+            fi
+        done < "$manifest"
+    fi
+
+    if [ ${#names[@]} -eq 0 ]; then
+        rm -f "$manifest"
+        return 0
+    fi
+
+    : > "$manifest.tmp"
+    idx=0
+    while [ "$idx" -lt ${#names[@]} ]; do
+        rm -rf "$skills_dest/${names[$idx]:?}"
+        cp -a "${srcs[$idx]}" "$skills_dest/${names[$idx]}"
+        printf '%s\n' "${names[$idx]}" >> "$manifest.tmp"
+        idx=$((idx + 1))
+    done
+    mv "$manifest.tmp" "$manifest"
+    echo -e "${GREEN}Skills deployed for this project:${NC} ${YELLOW}${names[*]}${NC}"
+    return 0
+}
+
+# Point out workspace skills that haven't been adopted user-wide yet.
+suggest_adoptable_skills() {
+    local name
+    for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR"); do
+        if ! valid_skill_name "$name" || is_bundled_skill "$name"; then
+            continue
+        fi
+        if [ -d "$USER_SKILLS_DIR/$name" ]; then
+            continue
+        fi
+        echo -e "${BLUE}Workspace skill '${name}' can be shared with every project:${NC} claude-container --skills-adopt ${name}"
+    done
+    return 0
+}
+
+skills_list() {
+    local name choice status desc any
+    echo -e "${GREEN}User-wide skills${NC} (${USER_SKILLS_DIR}):"
+    any=false
+    for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
+        any=true
+        choice="$(get_skill_choice "$name")"
+        case "$choice" in
+            accept) status="${GREEN}accepted${NC}" ;;
+            reject) status="${RED}rejected${NC}" ;;
+            *)      status="${YELLOW}undecided — will prompt at next launch${NC}" ;;
+        esac
+        desc="$(skill_description "$USER_SKILLS_DIR/$name")"
+        echo -e "  ${name} [${status}]${desc:+ — $desc}"
+    done
+    if [ "$any" = false ]; then
+        echo "  (none)"
+    fi
+    echo ""
+    echo -e "${GREEN}Workspace skills${NC} (${WORKSPACE_SKILLS_DIR}):"
+    any=false
+    for name in $(list_skill_dirs "$WORKSPACE_SKILLS_DIR"); do
+        any=true
+        if [ -d "$USER_SKILLS_DIR/$name" ]; then
+            status="always active here; adopted user-wide"
+        else
+            status="always active here; adopt with --skills-adopt $name"
+        fi
+        desc="$(skill_description "$WORKSPACE_SKILLS_DIR/$name")"
+        echo -e "  ${name} [${status}]${desc:+ — $desc}"
+    done
+    if [ "$any" = false ]; then
+        echo "  (none)"
+    fi
+    echo ""
+    echo -e "Project: ${YELLOW}${WORKSPACE_DIR}${NC}"
+    echo -e "Choices: ${YELLOW}$(choices_file)${NC}"
+    return 0
+}
+
+skills_adopt() {
+    local name="$1" src updated
+    if ! valid_skill_name "$name"; then
+        echo -e "${RED}Error: invalid skill name '$name' (lowercase letters, digits, hyphens).${NC}"
+        exit 1
+    fi
+    if is_bundled_skill "$name"; then
+        echo -e "${RED}Error: '$name' is reserved by an image-bundled skill.${NC}"
+        exit 1
+    fi
+    src="$WORKSPACE_SKILLS_DIR/$name"
+    if [ ! -f "$src/SKILL.md" ]; then
+        echo -e "${RED}Error: no workspace skill named '$name' (looked in $WORKSPACE_SKILLS_DIR).${NC}"
+        echo -e "${YELLOW}Run 'claude-container --skills' to see what's available.${NC}"
+        exit 1
+    fi
+    mkdir -p "$USER_SKILLS_DIR"
+    updated=false
+    if [ -d "$USER_SKILLS_DIR/$name" ]; then
+        updated=true
+    fi
+    rm -rf "$USER_SKILLS_DIR/${name:?}"
+    cp -a "$src" "$USER_SKILLS_DIR/$name"
+    set_skill_choice "$name" accept
+    if [ "$updated" = true ]; then
+        echo -e "${GREEN}Updated user-wide skill '$name' from this workspace.${NC}"
+    else
+        echo -e "${GREEN}Adopted '$name' into the user-wide skill set.${NC}"
+    fi
+    echo -e "${BLUE}Accepted for this project automatically; other projects are prompted at their next launch.${NC}"
+    return 0
+}
+
+skills_drop() {
+    local name="$1"
+    if ! valid_skill_name "$name" || [ ! -d "$USER_SKILLS_DIR/$name" ]; then
+        echo -e "${RED}Error: no user-wide skill named '$name'.${NC}"
+        exit 1
+    fi
+    rm -rf "$USER_SKILLS_DIR/${name:?}"
+    echo -e "${GREEN}Removed '$name' from the user-wide skill set.${NC}"
+    echo -e "${BLUE}Projects that had it deployed clean it up on their next launch.${NC}"
+    return 0
+}
+
+skills_set_project_choice() {
+    local name="$1" choice="$2"
+    if ! valid_skill_name "$name"; then
+        echo -e "${RED}Error: invalid skill name '$name'.${NC}"
+        exit 1
+    fi
+    if [ ! -f "$USER_SKILLS_DIR/$name/SKILL.md" ]; then
+        echo -e "${RED}Error: no user-wide skill named '$name'.${NC}"
+        if [ -f "$WORKSPACE_SKILLS_DIR/$name/SKILL.md" ]; then
+            echo -e "${YELLOW}'$name' is a workspace skill (always active in this project).${NC}"
+            echo -e "${YELLOW}Adopt it user-wide first: claude-container --skills-adopt $name${NC}"
+        else
+            echo -e "${YELLOW}Run 'claude-container --skills' to see available skills.${NC}"
+        fi
+        exit 1
+    fi
+    set_skill_choice "$name" "$choice"
+    if [ "$choice" = "accept" ]; then
+        echo -e "${GREEN}Skill '$name' accepted for this project. It will be deployed on the next launch.${NC}"
+    else
+        echo -e "${GREEN}Skill '$name' rejected for this project. Any deployed copy is removed on the next launch.${NC}"
+    fi
+    return 0
+}
+
+skills_reset() {
+    local file
+    file="$(choices_file)"
+    if [ -f "$file" ]; then
+        rm -f "$file"
+        echo -e "${GREEN}Cleared this project's skill choices. You'll be prompted again at the next launch.${NC}"
+    else
+        echo -e "${BLUE}No skill choices recorded for this project.${NC}"
+    fi
+    return 0
 }
 
 # Function to stop datasette
@@ -395,6 +799,23 @@ while [[ $# -gt 0 ]]; do
             SHOW_DATASETTE_LOGS=true
             shift
             ;;
+        --skills)
+            SKILLS_ACTION="list"
+            shift
+            ;;
+        --skills-adopt|--skills-drop|--skills-accept|--skills-reject)
+            if [ -z "${2:-}" ] || [[ "$2" == -* ]]; then
+                echo -e "${RED}Error: $1 requires a skill name${NC}"
+                exit 1
+            fi
+            SKILLS_ACTION="${1#--skills-}"
+            SKILLS_NAME="$2"
+            shift 2
+            ;;
+        --skills-reset)
+            SKILLS_ACTION="reset"
+            shift
+            ;;
         --pull)
             PULL_IMAGES=true
             shift
@@ -443,6 +864,25 @@ PROXY_DATA_DIR="${CLAUDE_PROXY_DATA:-$PROXY_DATA_DIR}"
 IMAGE="${CLAUDE_IMAGE:-$IMAGE}"
 PROXY_IMAGE="${CLAUDE_PROXY_IMAGE:-$PROXY_IMAGE}"
 DATASETTE_IMAGE="${CLAUDE_DATASETTE_IMAGE:-$DATASETTE_IMAGE}"
+
+# Handle skill management commands (host-side; no container involved).
+if [ -n "$SKILLS_ACTION" ]; then
+    if [ ! -d "$WORKSPACE_DIR" ]; then
+        echo -e "${RED}Error: Workspace directory does not exist: $WORKSPACE_DIR${NC}"
+        exit 1
+    fi
+    WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
+    WORKSPACE_SKILLS_DIR="$WORKSPACE_DIR/.claude-container-overlay/skills"
+    case "$SKILLS_ACTION" in
+        list)   skills_list ;;
+        adopt)  skills_adopt "$SKILLS_NAME" ;;
+        drop)   skills_drop "$SKILLS_NAME" ;;
+        accept) skills_set_project_choice "$SKILLS_NAME" accept ;;
+        reject) skills_set_project_choice "$SKILLS_NAME" reject ;;
+        reset)  skills_reset ;;
+    esac
+    exit 0
+fi
 
 # Handle shell mode - override command to drop into shell
 if [ "$SHELL_MODE" = true ]; then
@@ -555,16 +995,78 @@ CONFIG_DIR="$(cd "$CONFIG_DIR" && pwd)" 2>/dev/null || CONFIG_DIR="$(mkdir -p "$
 # Always disable Claude's permission prompts for this sandboxed container.
 ensure_bypass_permissions
 
-# Overlay support: if the workspace contains .claude-container-overlay, build a
-# workspace-local image whose Dockerfile is `FROM $IMAGE` followed by the
-# overlay's build instructions, and use that instead of the base image. The
-# overlay image is tagged with a content hash of (base image + overlay build
-# instructions) so switching branches that have different overlays just switches
-# images.
-OVERLAY_FILE="$WORKSPACE_DIR/.claude-container-overlay"
-if [ -f "$OVERLAY_FILE" ]; then
-    # Split the overlay into (a) port-forwarding directives and (b) the actual
-    # Dockerfile build instructions.
+# Per-project skill deployment: prompt for any user-wide skills this project
+# hasn't decided on yet, sync the effective set (workspace + accepted user-wide)
+# into the config dir's skills directory, then point out workspace skills that
+# could be adopted user-wide.
+WORKSPACE_SKILLS_DIR="$WORKSPACE_DIR/.claude-container-overlay/skills"
+prompt_undecided_skills
+sync_skills
+suggest_adoptable_skills
+
+# Overlay support: .claude-container-overlay at the workspace root layers
+# project-specific state on top of the shared base image.
+#
+# Directory form (canonical):
+#   .claude-container-overlay/
+#   ├── Dockerfile      build fragment appended to the base image; the overlay
+#   │                   directory is the docker build context, so COPY works
+#   ├── overlay.json    structured runtime config, e.g. {"ports": ["8080:8080"]}
+#   └── skills/<name>/  skills proposed from inside the container — deployed at
+#                       launch by sync_skills above, never baked into the image
+#
+# Legacy form (still supported): a single Dockerfile-fragment file with
+# `# claude-container:port <mapping>` directive comments for port mappings.
+#
+# The overlay image is tagged with a content hash of (base image + build inputs)
+# so switching branches that have different overlays just switches images.
+# Runtime-only inputs (overlay.json, skills/) are excluded from the hash, so
+# changing ports or skills never triggers a rebuild.
+OVERLAY_PATH="$WORKSPACE_DIR/.claude-container-overlay"
+PORT_MAPPINGS=()
+OVERLAY_BUILD=""
+OVERLAY_CONTEXT=""
+if [ -d "$OVERLAY_PATH" ]; then
+    # Port mappings come from overlay.json's "ports" array; each entry is passed
+    # straight to `docker run -p`.
+    if [ -f "$OVERLAY_PATH/overlay.json" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            while IFS= read -r port_mapping; do
+                if [ -n "$port_mapping" ]; then
+                    PORT_ARGS+=(-p "$port_mapping")
+                    PORT_MAPPINGS+=("$port_mapping")
+                fi
+            done < <(OVERLAY_JSON="$OVERLAY_PATH/overlay.json" python3 - <<'PY'
+import json, os, sys
+path = os.environ["OVERLAY_JSON"]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception as exc:
+    print(f"Warning: could not parse {path}: {exc}", file=sys.stderr)
+    sys.exit(0)
+ports = data.get("ports", []) if isinstance(data, dict) else []
+if isinstance(ports, str):
+    ports = [ports]
+for port in ports:
+    if isinstance(port, str) and port.strip():
+        print(port.strip())
+PY
+)
+        else
+            echo -e "${YELLOW}Warning: python3 not found; ignoring ports in overlay.json.${NC}"
+        fi
+    fi
+
+    if [ -f "$OVERLAY_PATH/Dockerfile" ]; then
+        OVERLAY_BUILD="$(cat "$OVERLAY_PATH/Dockerfile")"$'\n'
+        OVERLAY_CONTEXT="$OVERLAY_PATH"
+    fi
+elif [ -f "$OVERLAY_PATH" ]; then
+    echo -e "${BLUE}Note: single-file overlays still work, but .claude-container-overlay can now be${NC}"
+    echo -e "${BLUE}a directory (Dockerfile + overlay.json + skills/) — see the README.${NC}"
+    # Split the legacy overlay into (a) port-forwarding directives and (b) the
+    # actual Dockerfile build instructions.
     #
     # Port directives are comments of the form `# claude-container:port <mapping>`
     # where <mapping> is anything docker's -p accepts (8080:8080,
@@ -573,8 +1075,6 @@ if [ -f "$OVERLAY_FILE" ]; then
     # of OVERLAY_BUILD before hashing and building. That keeps the image hash
     # stable when you only add/change/remove port mappings — no rebuild, the
     # existing overlay image is reused.
-    PORT_MAPPINGS=()
-    OVERLAY_BUILD=""
     while IFS= read -r overlay_line || [ -n "$overlay_line" ]; do
         if [[ "$overlay_line" =~ ^[[:space:]]*#[[:space:]]*claude-container:[[:space:]]*port[[:space:]]+(.+)$ ]]; then
             port_mapping="${BASH_REMATCH[1]}"
@@ -587,17 +1087,28 @@ if [ -f "$OVERLAY_FILE" ]; then
         else
             OVERLAY_BUILD+="$overlay_line"$'\n'
         fi
-    done < "$OVERLAY_FILE"
+    done < "$OVERLAY_PATH"
+fi
 
-    if [ ${#PORT_MAPPINGS[@]} -gt 0 ]; then
-        echo -e "${GREEN}Publishing overlay ports:${NC} ${YELLOW}${PORT_MAPPINGS[*]}${NC}"
-    fi
+if [ ${#PORT_MAPPINGS[@]} -gt 0 ]; then
+    echo -e "${GREEN}Publishing overlay ports:${NC} ${YELLOW}${PORT_MAPPINGS[*]}${NC}"
+fi
 
-    # Hash base image tag + overlay build instructions (ports excluded) -> tag.
-    if command -v shasum >/dev/null 2>&1; then
-        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE"; printf '%s' "$OVERLAY_BUILD"; } | shasum -a 256 | cut -c1-12)
+if [ -n "$OVERLAY_BUILD" ]; then
+    # Hash base image tag + build inputs (runtime concerns excluded) -> tag. For
+    # directory overlays the inputs also include any extra context files the
+    # Dockerfile can COPY, keyed by relative path so renames re-hash too.
+    if [ -n "$OVERLAY_CONTEXT" ]; then
+        OVERLAY_HASH=$({
+            printf '%s\n' "$IMAGE"
+            printf '%s' "$OVERLAY_BUILD"
+            (cd "$OVERLAY_CONTEXT" && find . -type f ! -name Dockerfile ! -name overlay.json ! -path './skills/*' | LC_ALL=C sort | while IFS= read -r ctx_file; do
+                printf '%s\n' "$ctx_file"
+                cat "$ctx_file"
+            done)
+        } | sha256_12)
     else
-        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE"; printf '%s' "$OVERLAY_BUILD"; } | sha256sum | cut -c1-12)
+        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE"; printf '%s' "$OVERLAY_BUILD"; } | sha256_12)
     fi
     OVERLAY_IMAGE="claude-container-overlay:${OVERLAY_HASH}"
 
@@ -616,18 +1127,28 @@ if [ -f "$OVERLAY_FILE" ]; then
             echo -e "${YELLOW}overlay builds from the shared base and reuses cached layers.${NC}"
         fi
         echo -e "${GREEN}Building overlay image ${OVERLAY_IMAGE} from ${IMAGE}...${NC}"
-        BUILD_DIR="$(mktemp -d)"
-        trap 'rm -rf "$BUILD_DIR"' EXIT
-        {
-            printf 'FROM %s\n' "$IMAGE"
-            printf '%s' "$OVERLAY_BUILD"
-        } > "$BUILD_DIR/Dockerfile"
-        if ! docker build -t "$OVERLAY_IMAGE" "$BUILD_DIR"; then
-            echo -e "${RED}Error: Failed to build overlay image${NC}"
-            exit 1
+        if [ -n "$OVERLAY_CONTEXT" ]; then
+            # Directory overlay: build with the overlay directory as context so
+            # COPY works; the effective Dockerfile (FROM + fragment) is fed on
+            # stdin so the fragment itself never needs a FROM line.
+            if ! { printf 'FROM %s\n' "$IMAGE"; printf '%s' "$OVERLAY_BUILD"; } | docker build -t "$OVERLAY_IMAGE" -f - "$OVERLAY_CONTEXT"; then
+                echo -e "${RED}Error: Failed to build overlay image${NC}"
+                exit 1
+            fi
+        else
+            BUILD_DIR="$(mktemp -d)"
+            trap 'rm -rf "$BUILD_DIR"' EXIT
+            {
+                printf 'FROM %s\n' "$IMAGE"
+                printf '%s' "$OVERLAY_BUILD"
+            } > "$BUILD_DIR/Dockerfile"
+            if ! docker build -t "$OVERLAY_IMAGE" "$BUILD_DIR"; then
+                echo -e "${RED}Error: Failed to build overlay image${NC}"
+                exit 1
+            fi
+            rm -rf "$BUILD_DIR"
+            trap - EXIT
         fi
-        rm -rf "$BUILD_DIR"
-        trap - EXIT
     fi
     IMAGE="$OVERLAY_IMAGE"
 fi

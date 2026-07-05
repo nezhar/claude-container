@@ -20,6 +20,12 @@ _claude_container_completion() {
         --datasette-port
         --datasette-stop
         --datasette-logs
+        --skills
+        --skills-adopt
+        --skills-drop
+        --skills-accept
+        --skills-reject
+        --skills-reset
         --pull
         --shell
         --tmux
@@ -33,8 +39,11 @@ _claude_container_completion() {
     # Flags that expect a port number
     local port_flags="--datasette-port"
 
+    # Flags that expect a skill name
+    local skill_flags="--skills-adopt --skills-drop --skills-accept --skills-reject"
+
     # Flags that don't take arguments (actions)
-    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --pull --shell --tmux --version -v --help -h"
+    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --skills --skills-reset --pull --shell --tmux --version -v --help -h"
 
     case "$prev" in
         --workspace|-w|--config|-c|--proxy-data)
@@ -45,6 +54,22 @@ _claude_container_completion() {
         --datasette-port)
             # Suggest common ports
             COMPREPLY=($(compgen -W "8001 8002 8080 3000 4000 5000" -- "$cur"))
+            return 0
+            ;;
+        --skills-adopt)
+            # Complete with workspace skill names (proposed in the overlay)
+            local ws_skills_dir="./.claude-container-overlay/skills"
+            if [[ -d "$ws_skills_dir" ]]; then
+                COMPREPLY=($(compgen -W "$(command ls -1 "$ws_skills_dir" 2>/dev/null)" -- "$cur"))
+            fi
+            return 0
+            ;;
+        --skills-drop|--skills-accept|--skills-reject)
+            # Complete with user-wide skill names
+            local user_skills_dir="$HOME/.config/claude-container/user-skills"
+            if [[ -d "$user_skills_dir" ]]; then
+                COMPREPLY=($(compgen -W "$(command ls -1 "$user_skills_dir" 2>/dev/null)" -- "$cur"))
+            fi
             return 0
             ;;
     esac

@@ -1,15 +1,54 @@
 ---
 name: container-overlay
-description: Persist tools you needed inside the claude-container so they're available next launch. Use whenever you ran apt-get install, configured a global utility (Nix/Homebrew/asdf/cargo install -g, system Python packages), or otherwise mutated the container in a way that should survive a restart. Append to `.claude-container-overlay` at the workspace root — the launcher rebuilds the image with that file appended to its Dockerfile on the next run.
+description: Persist tools you needed inside the claude-container so they're available next launch. Use whenever you ran apt-get install, configured a global utility (Nix/Homebrew/asdf/cargo install -g, system Python packages), or otherwise mutated the container in a way that should survive a restart. Append to `.claude-container-overlay/Dockerfile` at the workspace root (and declare ports in `overlay.json`) — the launcher rebuilds the image with that fragment appended on the next run.
 ---
 
 # claude-container overlay
 
-The Ubuntu-based `claude-container` image is shared across all workspaces. To install project-specific tooling **persistently** without forking the base image, write a Dockerfile fragment to `.claude-container-overlay` at the workspace root. The launcher detects this file, appends it to the base Dockerfile, and rebuilds a workspace-local image tagged with a hash of the overlay contents.
+The Ubuntu-based `claude-container` image is shared across all workspaces. To install project-specific tooling **persistently** without forking the base image, maintain a `.claude-container-overlay/` directory at the workspace root. The launcher detects it, appends its `Dockerfile` to the base image's, and rebuilds a workspace-local image tagged with a content hash of the build inputs.
 
 You almost never need to ask the user before doing this — if you just ran `apt-get install foo` and confirmed `foo` works, persisting it is the expected next step. The cost of a stale overlay is low (rebuild takes seconds when cached); the cost of forgetting and re-installing every session is high.
 
-## When to use this skill
+## Layout
+
+```
+.claude-container-overlay/
+├── Dockerfile      # build fragment, appended to the base image (no FROM line)
+├── overlay.json    # structured runtime config: {"ports": [...]}
+└── skills/<name>/  # proposed skills — see the container-skills skill
+```
+
+All three parts are optional; create only what you need. The directory can be committed to the repo.
+
+- **`Dockerfile`** — a fragment concatenated after `FROM <base-image>` during `docker build`. It executes **as root** at build time (the entrypoint switches users at runtime). The overlay directory is the **build context**, so `COPY someconf /etc/someconf` works for files you place next to the Dockerfile.
+- **`overlay.json`** — runtime configuration the launcher reads. Currently: a `ports` array of mappings passed straight to `docker run -p`.
+- **`skills/`** — skill proposals; deployed at launch, never baked into the image. Covered by the `container-skills` skill, not this one.
+
+A legacy form — `.claude-container-overlay` as a single Dockerfile-fragment *file* with `# claude-container:port <mapping>` comments — still works. If you find one, migrate it: `mkdir` the directory, move the fragment to `Dockerfile` (dropping the port comments), and convert the port comments into `overlay.json`.
+
+## A normal Dockerfile entry
+
+```dockerfile
+# 2026-06-18: opencv runtime libs for the camera calibration script
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+## Port forwarding
+
+To make a dev server, web UI, or debugger inside the container reachable from the host, declare mappings in `overlay.json`:
+
+```json
+{
+  "ports": ["8080:8080", "127.0.0.1:3000:3000", "9000:9000/udp"]
+}
+```
+
+Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. `overlay.json` is excluded from the image hash, so **adding, changing, or removing a port mapping never triggers a rebuild** — it only changes the `-p` flags on the next `docker run`.
+
+## When to add a Dockerfile entry
 
 Trigger this skill any time you run a command that mutates global container state and you want it available next session. Concrete triggers:
 
@@ -22,49 +61,13 @@ Trigger this skill any time you run a command that mutates global container stat
 
 Do **not** use this for workspace-scoped state — pyproject deps, Bazel rules, pnpm workspace deps, repo-local configs. Those belong in the repo's normal manifests.
 
-## The overlay file
-
-Path: `<workspace-root>/.claude-container-overlay`
-
-Format: a Dockerfile fragment that gets concatenated to the end of the base image's Dockerfile during `docker build`. It executes **as root** during build (the base image's `USER` directive isn't set; the entrypoint switches users at runtime).
-
-A normal entry looks like:
-
-```dockerfile
-# 2026-06-18: opencv runtime libs for the camera calibration script
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 \
-        libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-```
-
-## Port forwarding
-
-The overlay can also publish container ports to the host, so a dev server, web UI,
-or debugger running inside the container is reachable from your machine. Declare
-mappings with directive comments anywhere in the overlay file:
-
-```dockerfile
-# claude-container:port 8080:8080
-# claude-container:port 127.0.0.1:3000:3000
-# claude-container:port 9000:9000/udp
-```
-
-Everything after `claude-container:port` is passed straight to `docker run -p`, so
-any value docker accepts works: `host:container`, `ip:host:container`, a bare
-container port, or a `/udp` suffix. The launcher strips these directives out
-before hashing/building the overlay image, so **adding, changing, or removing a
-port mapping never triggers an image rebuild** — it only changes the `-p` flags on
-the next `docker run`. Pair the port directive with whatever installs/starts the
-service (e.g. a `RUN` that installs it) so the mapping and the server stay together.
-
 ## Append, don't rewrite
 
-**Strongly bias toward appending new `RUN` blocks rather than editing existing ones.** Docker caches each layer by the literal text of its instruction. If you edit an earlier line, every layer after it rebuilds from scratch.
+**Strongly bias toward appending new `RUN` blocks to the Dockerfile rather than editing existing ones.** Docker caches each layer by the literal text of its instruction. If you edit an earlier line, every layer after it rebuilds from scratch.
 
 Concretely:
 
-- **Good** — adding a new package next session: append a *new* `RUN apt-get install -y --no-install-recommends newpkg && rm -rf /var/lib/apt/lists/*` block at the bottom.
+- **Good** — adding a new package next session: append a *new* `RUN apt-get update && apt-get install -y --no-install-recommends newpkg && rm -rf /var/lib/apt/lists/*` block at the bottom.
 - **Bad** — adding `newpkg` to the package list of an existing `RUN apt-get install` block. That invalidates the cached layer and every layer below it.
 
 The only reasons to edit an existing entry:
@@ -92,7 +95,7 @@ Always combine `apt-get update` and `apt-get install` in the same `RUN` (otherwi
 
 ### Nix
 
-If the project uses Nix, install it once at the bottom of the overlay and never re-run that block. Subsequent Nix package additions belong in a `flake.nix` / `default.nix` checked into the repo, not in the overlay:
+If the project uses Nix, install it once at the bottom of the Dockerfile and never re-run that block. Subsequent Nix package additions belong in a `flake.nix` / `default.nix` checked into the repo, not in the overlay:
 
 ```dockerfile
 # 2026-06-18: single-user Nix install (project uses flakes)
@@ -115,28 +118,39 @@ RUN curl -fsSL -o /tmp/tf.zip \
     && terraform -version
 ```
 
+### A config file baked into the image
+
+Place the file next to the Dockerfile and `COPY` it (the overlay directory is the build context):
+
+```dockerfile
+# 2026-06-18: custom pip index config
+COPY pip.conf /etc/pip.conf
+```
+
 ## Workflow
 
 1. You've just installed something inside the running container and confirmed it works.
-2. Read `.claude-container-overlay` if it exists. If it doesn't, create it.
+2. Read `.claude-container-overlay/Dockerfile` if it exists. If not, create the directory and file. (If `.claude-container-overlay` is a legacy single file, migrate it first — see Layout above.)
 3. **Append** a new `RUN` block (or `ENV`/`COPY` line) to the end. Date the comment so future-you can prune dead entries.
-4. Tell the user briefly: "Persisted `<thing>` to `.claude-container-overlay` — the next `claude-container` launch will rebuild the image with it baked in (~30s on first run, cached after)."
+4. Tell the user briefly: "Persisted `<thing>` to `.claude-container-overlay/Dockerfile` — the next `claude-container` launch will rebuild the image with it baked in (~30s on first run, cached after)."
 5. Don't run `docker build` yourself. The launcher handles it on next invocation.
 
 ## What the launcher does
 
-When `claude-container` starts in a workspace containing `.claude-container-overlay`:
+When `claude-container` starts in a workspace containing `.claude-container-overlay/`:
 
-1. Hashes the overlay file plus the base image tag.
-2. Looks for a local image tagged `claude-container-overlay:<hash>`.
-3. If it exists, uses it. If not, builds it: `FROM <base-image>` followed by the overlay's contents.
-4. Runs the container as usual against that image.
+1. Reads port mappings from `overlay.json` (runtime-only; never affects the image).
+2. Hashes the base image tag + `Dockerfile` + any other files in the directory (excluding `overlay.json` and `skills/`).
+3. Looks for a local image tagged `claude-container-overlay:<hash>`.
+4. If it exists, uses it. If not, builds it: `FROM <base-image>` followed by the fragment, with the overlay directory as build context.
+5. Runs the container as usual against that image, adding the `-p` flags.
 
 Because the tag is content-addressed, switching branches that have different overlays just switches images — no rebuild needed if you've used that overlay before.
 
 ## Things that won't work
 
-- `USER` directives in the overlay — the base image's entrypoint manages users dynamically based on `USER_UID`/`USER_GID`. Setting `USER` in the overlay breaks the UID-mapping flow.
+- `USER` directives in the fragment — the base image's entrypoint manages users dynamically based on `USER_UID`/`USER_GID`. Setting `USER` breaks the UID-mapping flow.
 - `ENTRYPOINT` / `CMD` — same reason; the base image's entrypoint must run.
 - `WORKDIR` other than `/workspace` — `/workspace` is the bind mount point.
-- Anything that requires the workspace files to be present at *build* time. The workspace is mounted at *run* time. If you need files inside the image, copy them into a stable subdirectory in the overlay context, but prefer not to — bind mounts are simpler.
+- `COPY` of workspace files outside the overlay directory — the build context is `.claude-container-overlay/` only, and the workspace is mounted at *run* time. If you need a file in the image, copy it into the overlay directory first, but prefer not to — bind mounts are simpler.
+- `COPY` of `skills/` or `overlay.json` into the image — they're excluded from the rebuild hash, so the image would silently go stale when they change.

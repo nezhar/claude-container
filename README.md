@@ -128,37 +128,54 @@ The helper script will automatically pull the latest Docker images when needed.
 ### Workspace Overlay
 
 The base `claude-container` image is shared across all workspaces. To layer
-project-specific tooling on top of it **persistently**, drop a
-`.claude-container-overlay` file at your workspace root. It is a Dockerfile
-fragment that the launcher appends to the base image, building a workspace-local
-image tagged `claude-container-overlay:<hash>` (content-addressed over the base
-image tag plus the overlay contents). Switching branches with different overlays
-just switches images — no rebuild if you've used that overlay before.
+project-specific state on top of it **persistently**, create a
+`.claude-container-overlay/` directory at your workspace root:
+
+```
+.claude-container-overlay/
+├── Dockerfile      # build fragment appended to the base image
+├── overlay.json    # structured runtime config (ports, ...)
+└── skills/<name>/  # skills proposed from inside the container (see below)
+```
+
+All three parts are optional — create only what you need, and commit the
+directory to the repo if the whole team should share it.
+
+**`Dockerfile`** is a fragment (no `FROM` line) that the launcher appends to the
+base image, building a workspace-local image tagged
+`claude-container-overlay:<hash>` (content-addressed over the base image tag
+plus the build inputs). Switching branches with different overlays just switches
+images — no rebuild if you've used that overlay before. The overlay directory is
+the docker build context, so the fragment can `COPY` files placed next to it.
 
 ```dockerfile
-# .claude-container-overlay
+# .claude-container-overlay/Dockerfile
 # 2026-06-25: ffmpeg for the video pipeline tests
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 ```
 
-#### Port Forwarding
+**`overlay.json`** holds structured runtime configuration — data the launcher
+reads at `docker run` time rather than baking into the image. Currently that is
+port forwarding (for a dev server, web UI, debugger, etc.):
 
-The overlay can also publish container ports to the host (for a dev server, web
-UI, debugger, etc.). Add directive comments anywhere in the overlay file:
-
-```dockerfile
-# claude-container:port 8080:8080
-# claude-container:port 127.0.0.1:3000:3000
-# claude-container:port 9000:9000/udp
+```json
+{
+  "ports": ["8080:8080", "127.0.0.1:3000:3000", "9000:9000/udp"]
+}
 ```
 
-Everything after `claude-container:port` is passed straight to `docker run -p`,
-so any value Docker accepts works (`host:container`, `ip:host:container`, a bare
-container port, or a `/udp` suffix). These are plain Dockerfile comments, so they
-don't affect the build — the launcher reads them and adds the `-p` flags when it
-starts the container.
+Each entry is passed straight to `docker run -p`, so any value Docker accepts
+works (`host:container`, `ip:host:container`, a bare container port, or a `/udp`
+suffix). `overlay.json` and `skills/` are excluded from the image hash, so
+changing ports or skills never triggers a rebuild.
+
+**Legacy form:** a single `.claude-container-overlay` *file* (a Dockerfile
+fragment with `# claude-container:port <mapping>` directive comments) is still
+supported, but the directory form is preferred — the launcher prints a migration
+hint when it sees one, and the bundled `container-overlay` skill teaches Claude
+to migrate it.
 
 ### Permissions
 
@@ -186,15 +203,62 @@ baked in (under `claude-code/skills/`) so Claude knows how to use the
 container-specific features in **every** workspace, with no per-project setup:
 
 - **`container-overlay`** — how to persist tooling and declare port mappings via
-  `.claude-container-overlay`.
+  the `.claude-container-overlay/` directory.
 - **`container-tmux`** — how to drive the tmux session when running with `--tmux`
   (see below).
+- **`container-skills`** — how to propose new skills from inside the container
+  (see the next section).
 
 The skills are copied into Claude's skills directory automatically when the
 container starts (the entrypoint deploys them from `/opt/claude-container/skills`,
 refreshed on each launch so they always match the image version). To add or edit
 a bundled skill, change the files under `claude-code/skills/` and rebuild the
 image.
+
+### Skill Proposals and Sharing
+
+Beyond the baked-in skills, skills can flow from a single session out to every
+claude-container project on the machine, through three tiers:
+
+1. **Workspace skills** — `<workspace>/.claude-container-overlay/skills/<name>/SKILL.md`.
+   Claude proposes a skill from inside the container by writing it here (the
+   bundled `container-skills` skill teaches it how and when). Workspace skills
+   are always deployed for their own project at the next launch, and can be
+   committed to the repo along with the rest of the overlay.
+2. **User-wide skills** — `~/.config/claude-container/user-skills/<name>/`.
+   Adopt a workspace skill into this set to offer it to every claude-container
+   instance on the system (the adopting project accepts it automatically):
+
+   ```bash
+   claude-container --skills-adopt <name>
+   ```
+
+3. **Per-project choices** — when a launch finds a user-wide skill the current
+   project hasn't decided on, it prompts once (**y**es / **n**o / **s**kip).
+   Yes/no answers are sticky, stored per project under
+   `~/.config/claude-container/skill-choices/`; skip asks again next launch.
+   Non-interactive launches never prompt — undecided skills just stay undeployed
+   until an interactive launch (or `--skills-accept`) decides them.
+
+At every launch the effective set — workspace skills plus accepted user-wide
+skills — is synced into the config dir's `skills/` directory. A manifest file
+(`skills/.claude-container-managed`) tracks which entries the launcher manages,
+so rejected or removed skills are cleaned up without touching skills you placed
+there by hand or the image-bundled ones. Because the config dir is shared, the
+sync reflects the most recently launched project; concurrently running
+containers for projects with *different* accepted sets will see the last
+launcher's set.
+
+Manage everything with:
+
+| Command | Effect |
+|---|---|
+| `claude-container --skills` | List user-wide + workspace skills and this project's choices |
+| `claude-container --skills-adopt <name>` | Copy a workspace skill into the user-wide set |
+| `claude-container --skills-accept <name>` | Include a user-wide skill in this project (sticky) |
+| `claude-container --skills-reject <name>` | Exclude a user-wide skill from this project (sticky) |
+| `claude-container --skills-reset` | Forget this project's choices (prompts again next launch) |
+| `claude-container --skills-drop <name>` | Remove a skill from the user-wide set |
 
 ### Running Inside tmux
 
