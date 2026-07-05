@@ -61,7 +61,33 @@ When using all three images together, the request flow looks like this:
 
 ## Quick Start
 
-### Using the Helper Script (Recommended)
+### Installing from this Repository (Recommended)
+
+This fork ships its own Ubuntu-based container image, so install from a checkout
+rather than pulling from Docker Hub:
+
+```bash
+git clone git@github.com:fughilli/claude-container.git
+cd claude-container
+./install.sh
+```
+
+The installer:
+
+- copies the launcher to `~/.local/bin/claude-container`,
+- installs bash completions to `~/.local/share/bash-completion/completions/`,
+- builds the container image from `claude-code/` and tags it with the version
+  the launcher expects (shadowing the Docker Hub image of the same name).
+
+It is idempotent — re-running it is also the update path after `git pull` or
+after editing `claude-code/` (the rebuild is cached, so unchanged layers cost
+nothing). See `./install.sh --help` for options (`--system` for
+`/usr/local/bin`, `--no-build`, custom directories).
+
+Avoid `claude-container --pull` with this fork: it would replace the locally
+built image with the upstream Docker Hub one.
+
+### Using the Helper Script (upstream image)
 
 The easiest way to run Claude Container is using the provided bash script. Download and install it with:
 
