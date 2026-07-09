@@ -1095,12 +1095,18 @@ if [ ${#PORT_MAPPINGS[@]} -gt 0 ]; then
 fi
 
 if [ -n "$OVERLAY_BUILD" ]; then
-    # Hash base image tag + build inputs (runtime concerns excluded) -> tag. For
+    # Hash base image + build inputs (runtime concerns excluded) -> tag. For
     # directory overlays the inputs also include any extra context files the
     # Dockerfile can COPY, keyed by relative path so renames re-hash too.
+    #
+    # The base is keyed by its image ID (content), not just its tag: locally
+    # rebuilding the base reuses the same tag, and hashing only the tag would
+    # keep serving overlay images built from the stale base. Fall back to the
+    # tag when the image isn't present locally yet (docker run pulls it later).
+    BASE_IMAGE_KEY=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || printf '%s' "$IMAGE")
     if [ -n "$OVERLAY_CONTEXT" ]; then
         OVERLAY_HASH=$({
-            printf '%s\n' "$IMAGE"
+            printf '%s\n' "$IMAGE" "$BASE_IMAGE_KEY"
             printf '%s' "$OVERLAY_BUILD"
             (cd "$OVERLAY_CONTEXT" && find . -type f ! -name Dockerfile ! -name overlay.json ! -path './skills/*' | LC_ALL=C sort | while IFS= read -r ctx_file; do
                 printf '%s\n' "$ctx_file"
@@ -1108,7 +1114,7 @@ if [ -n "$OVERLAY_BUILD" ]; then
             done)
         } | sha256_12)
     else
-        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE"; printf '%s' "$OVERLAY_BUILD"; } | sha256_12)
+        OVERLAY_HASH=$({ printf '%s\n' "$IMAGE" "$BASE_IMAGE_KEY"; printf '%s' "$OVERLAY_BUILD"; } | sha256_12)
     fi
     OVERLAY_IMAGE="claude-container-overlay:${OVERLAY_HASH}"
 

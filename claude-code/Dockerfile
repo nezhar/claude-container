@@ -90,6 +90,11 @@ RUN chmod +x /usr/local/bin/claude-tmux
 # workspace without per-project provisioning.
 COPY skills/ /opt/claude-container/skills/
 
+# UTF-8 locale (glibc's built-in C.utf8) — without it tmux assumes a non-UTF-8
+# terminal and renders all non-ASCII output as underscores. Kept last so the
+# layer cache above is unaffected.
+ENV LANG=C.UTF-8
+
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sh", "-c", "echo 'Claude Code container is ready!'"]
