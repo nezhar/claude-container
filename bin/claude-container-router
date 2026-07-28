@@ -144,7 +144,11 @@ def dial_mux(instance, service):
     try:
         sock = socket.create_connection(("127.0.0.1", entry["mux_port"]), timeout=10)
     except OSError as exc:
-        raise RuntimeError(f"cannot reach container mux for '{instance}': {exc}")
+        raise RuntimeError(
+            f"cannot reach container mux for '{instance}': {exc} — the container "
+            "is likely running an image without svc-mux; re-run ./install.sh and "
+            "relaunch that claude-container session"
+        )
     try:
         sock.sendall(service.encode("ascii") + b"\n")
         line = b""
@@ -155,7 +159,17 @@ def dial_mux(instance, service):
             line += b_
         reply = line.decode("ascii", "replace").strip()
         if not reply.startswith("OK"):
-            raise RuntimeError(reply[4:] if reply.startswith("ERR ") else reply or "mux closed connection")
+            if reply.startswith("ERR "):
+                raise RuntimeError(reply[4:])
+            # Empty reply: docker accepted the published port but nothing
+            # answered inside — the usual sign of a container whose image
+            # predates svc-mux.
+            raise RuntimeError(
+                reply
+                or f"container mux for '{instance}' closed the connection — the "
+                "container is likely running an image without svc-mux; re-run "
+                "./install.sh and relaunch that claude-container session"
+            )
     except (OSError, RuntimeError):
         sock.close()
         raise

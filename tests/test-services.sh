@@ -217,12 +217,16 @@ SVC2_PORT=$(free_port)
 PIDS+=($!)
 wait_port "$SVC2_PORT" || fail "second backend did not start"
 
+DOWN_PORT=$(free_port)
 cat > "$WS/.claude-container-overlay/overlay.json" <<EOF
-{"services": {"web": $SVC1_PORT, "web2": $SVC2_PORT}}
+{"services": {"web": $SVC1_PORT, "web2": $SVC2_PORT, "down": $DOWN_PORT}}
 EOF
 
 out=$(curl -s -H "Host: web2.myws.claude" "http://127.0.0.1:$HTTP_PORT/hello.txt")
 assert_eq "service added to overlay.json works immediately" "$out" "hello-from-web2"
+
+out=$(curl -s -H "Host: down.myws.claude" "http://127.0.0.1:$HTTP_PORT/")
+assert_contains "declared-but-not-running service explains itself" "$out" "is the server running inside the container?"
 
 echo "== launcher registration (stub docker) =="
 

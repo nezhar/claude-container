@@ -96,10 +96,24 @@ class MuxHandler(socketserver.BaseRequestHandler):
         try:
             name = read_line(client, MAX_PREAMBLE)
             port = resolve_service(name)
-            upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
         except (ValueError, OSError) as exc:
             try:
                 client.sendall(f"ERR {exc}\n".encode())
+            except OSError:
+                pass
+            return
+        try:
+            upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
+        except OSError as exc:
+            # Distinguish "name doesn't resolve" from "resolves but nothing is
+            # listening" — the latter means the server isn't up (or the
+            # overlay.json port is wrong), not a forwarding problem.
+            try:
+                client.sendall(
+                    f"ERR service '{name}' is declared on port {port} but "
+                    f"connecting to it failed ({exc}) — is the server running "
+                    f"inside the container?\n".encode()
+                )
             except OSError:
                 pass
             return
