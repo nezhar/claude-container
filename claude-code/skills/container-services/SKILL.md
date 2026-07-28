@@ -43,6 +43,27 @@ Rules:
 - Keep any existing keys in `overlay.json` (`ports`, other services) intact —
   read-modify-write the JSON.
 
+## TLS (https) services
+
+If the server only speaks TLS, mark it — name-based HTTP routing can't carry
+TLS, so the router must link it differently:
+
+```json
+{
+  "services": {"web": 8080, "web-tls": {"port": 8443, "tls": true}}
+}
+```
+
+For `tls` services the dashboard (`http://127.0.0.1:8484/`) and
+`claude-container --services` render a clickable `https://127.0.0.1:<port>/`
+link through an automatically allocated raw TCP forward instead of a hostname
+URL. Tell the user to expect a self-signed-certificate warning, and that the
+forwarded port is stable only while the router runs. Prefer running the server
+as plain HTTP when it supports it — the whole path is loopback-tunneled, so
+TLS adds friction (cert warnings, no named URL) without adding security. Use
+the `tls` flag when the app genuinely needs TLS semantics (e.g. it serves
+`wss://` clients or exercises TLS-specific behavior).
+
 ## The instance name
 
 `$CLAUDE_SERVICE_INSTANCE` is set in the container's environment by the

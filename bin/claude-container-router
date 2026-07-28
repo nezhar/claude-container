@@ -119,23 +119,37 @@ def read_registry():
 
 
 def instance_services(entry):
-    """Declared services of an instance, read from its workspace overlay.json."""
+    """Declared services of an instance, read from its workspace overlay.json.
+
+    Values are normalized to {"port": int|None, "tls": bool} — overlay.json
+    accepts either a bare port or the extended {"port": N, "tls": true} form
+    (tls marks a service the router should link via a raw forward with an
+    https:// URL, since name-based HTTP routing can't carry TLS).
+    """
     path = os.path.join(
         entry.get("workspace", ""), ".claude-container-overlay", "overlay.json"
     )
+    out = {}
     try:
         with open(path) as f:
             data = json.load(f)
         services = data.get("services", {})
-        if isinstance(services, dict):
-            return {
-                k: v
-                for k, v in services.items()
-                if isinstance(k, str) and NAME_RE.match(k)
-            }
+        if not isinstance(services, dict):
+            return out
+        for k, v in services.items():
+            if not (isinstance(k, str) and NAME_RE.match(k)):
+                continue
+            tls = False
+            port = v
+            if isinstance(v, dict):
+                tls = bool(v.get("tls"))
+                port = v.get("port")
+            if isinstance(port, str) and port.isdigit():
+                port = int(port)
+            out[k] = {"port": port if isinstance(port, int) else None, "tls": tls}
     except Exception:
         pass
-    return {}
+    return out
 
 
 def dial_mux(instance, service):
@@ -314,6 +328,18 @@ def index_page():
                 f"in {entry.get('workspace', '?')}/.claude-container-overlay/overlay.json</i></td></tr>"
             )
         for svc in sorted(services):
+            if services[svc]["tls"]:
+                # TLS can't ride the name-based HTTP routing; allocate the raw
+                # forward here so the link is one click (self-signed cert
+                # warning still applies).
+                fwd = ensure_forwarder(instance, svc)
+                url = f"https://127.0.0.1:{fwd}/"
+                rows.append(
+                    f"<tr><td>{instance}</td><td>{svc}</td>"
+                    f"<td><a href='{url}'>{url}</a></td>"
+                    f"<td>TLS, via raw forward — expect a self-signed cert warning</td></tr>"
+                )
+                continue
             url = service_url(svc, instance)
             rows.append(
                 f"<tr><td>{instance}</td><td>{svc}</td>"
@@ -325,8 +351,8 @@ def index_page():
         "<style>body{font-family:sans-serif;margin:2em}td,th{padding:.3em .8em;"
         "text-align:left;border-bottom:1px solid #ddd}</style>"
         "<h1>claude-container services</h1>"
-        "<table><tr><th>instance</th><th>service</th><th>host form</th>"
-        "<th>path form</th></tr>" + "".join(rows) + "</table>"
+        "<table><tr><th>instance</th><th>service</th><th>open</th>"
+        "<th>alt</th></tr>" + "".join(rows) + "</table>"
         + ("<p><i>No containers registered.</i></p>" if not registry else "")
         + f"<p>Raw TCP: <code>claude-container --service-port &lt;instance&gt;/&lt;service&gt;</code>"
         f" &middot; DNS for <code>*.{DOMAIN}</code> on {BIND}:{DNS_PORT}/udp</p>"
@@ -678,12 +704,25 @@ def cmd_status():
     return cmd_services()
 
 
+def fetch_forward_port(instance, service):
+    """Ask the running daemon for a raw-forward port (allocating if needed)."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{BIND}:{HTTP_PORT}/.cc/port/{instance}/{service}", timeout=2
+        ) as resp:
+            port = json.load(resp).get("port")
+            return port if isinstance(port, int) else None
+    except Exception:
+        return None
+
+
 def cmd_services():
     sync_bound_ports()
     registry = read_registry()
     if not registry:
         print("no containers registered")
         return 0
+    router_up = health_ok()
     for instance in sorted(registry):
         entry = registry[instance]
         services = instance_services(entry)
@@ -691,6 +730,15 @@ def cmd_services():
         if not services:
             print("    no services declared in overlay.json")
         for svc in sorted(services):
+            if services[svc]["tls"]:
+                fwd = fetch_forward_port(instance, svc) if router_up else None
+                if fwd:
+                    print(f"    {svc:<20} https://127.0.0.1:{fwd}/  (tls, raw forward)")
+                else:
+                    print(
+                        f"    {svc:<20} tls — claude-container --service-port {instance}/{svc}"
+                    )
+                continue
             print(f"    {svc:<20} {service_url(svc, instance)}")
     return 0
 

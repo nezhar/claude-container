@@ -78,9 +78,11 @@ SVC1_PORT=$(free_port)
 (cd "$TMP/docroot1" && exec python3 -m http.server "$SVC1_PORT" --bind 127.0.0.1) >/dev/null 2>&1 &
 PIDS+=($!)
 
-# Only service "web" is declared up front; "web2" is added live later.
+# Only "web" and the TLS-marked "secure" are declared up front; "web2" is
+# added live later. ("secure" points at the plain backend — scheme handling is
+# what's under test, the forward is bytes either way.)
 cat > "$WS/.claude-container-overlay/overlay.json" <<EOF
-{"services": {"web": $SVC1_PORT}}
+{"services": {"web": $SVC1_PORT, "secure": {"port": $SVC1_PORT, "tls": true}}}
 EOF
 
 MUX_PORT=$(free_port)
@@ -132,6 +134,16 @@ assert_eq "mux answers OK for a declared service" "$out" "OK"
 out=$(python3 - "$MUX_PORT" <<'PY'
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)
+s.sendall(b"secure\n")
+f = s.makefile("rb")
+print(f.readline().decode().split()[0])
+PY
+)
+assert_eq "mux resolves the extended {port, tls} form" "$out" "OK"
+
+out=$(python3 - "$MUX_PORT" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)
 s.sendall(b"nope\n")
 print(s.makefile("rb").readline().decode().strip())
 PY
@@ -155,6 +167,14 @@ assert_eq "path-form routing" "$out" "hello-from-web"
 out=$(curl -s "http://127.0.0.1:$HTTP_PORT/")
 assert_contains "index lists the instance" "$out" "myws"
 assert_contains "index links the service host form" "$out" "web.myws.claude.localhost:$HTTP_PORT"
+assert_contains "index links TLS services via https raw forward" "$out" "href='https://127.0.0.1:"
+
+tls_fwd=$(echo "$out" | grep -o "https://127.0.0.1:[0-9]*" | head -1 | grep -o "[0-9]*$")
+out=$(curl -s "http://127.0.0.1:$tls_fwd/hello.txt")
+assert_eq "the dashboard's TLS forward pipes to the service" "$out" "hello-from-web"
+
+out=$(python3 "$ROUTER" services)
+assert_contains "services CLI shows the https link for TLS services" "$out" "https://127.0.0.1:$tls_fwd/"
 
 out=$(curl -s "http://127.0.0.1:$HTTP_PORT/.cc/services")
 assert_contains "API lists declared services" "$out" '"web"'

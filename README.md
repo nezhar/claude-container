@@ -214,8 +214,15 @@ port, and any number of in-container services are tunneled through it by name.
 Declare them in `overlay.json`:
 
 ```json
-{ "services": {"dashboard": 8099, "api": 8080} }
+{ "services": {"dashboard": 8099, "api": 8080, "web-tls": {"port": 8443, "tls": true}} }
 ```
+
+A bare number declares a plain-HTTP service; the extended `{"port": N,
+"tls": true}` form marks a TLS server. TLS can't ride the name-based HTTP
+routing, so for those the dashboard and `--services` instead render a
+clickable `https://127.0.0.1:<port>/` link through an automatically allocated
+raw TCP forward (expect the self-signed-certificate warning; the port is
+stable while the router runs).
 
 A small host-side daemon, `claude-container-router` (started automatically at
 launch), gives every instance's services stable names:

@@ -52,6 +52,10 @@ def resolve_service(name):
     if not isinstance(services, dict):
         raise ValueError('overlay.json has no "services" object')
     port = services.get(name)
+    # Extended form: {"port": 8443, "tls": true}. The tls flag is for the
+    # host-side router (scheme of the link it renders); the mux only tunnels.
+    if isinstance(port, dict):
+        port = port.get("port")
     if isinstance(port, str) and port.isdigit():
         port = int(port)
     if not isinstance(port, int) or not (0 < port < 65536):

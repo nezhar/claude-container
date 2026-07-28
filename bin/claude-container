@@ -1335,8 +1335,15 @@ import json, os
 try:
     with open(os.environ["OVERLAY_JSON"]) as f:
         services = json.load(f).get("services", {})
+    parts = []
     if isinstance(services, dict):
-        print(" ".join(f"{k}:{v}" for k, v in sorted(services.items())))
+        for k, v in sorted(services.items()):
+            # Bare port, or extended {"port": N, "tls": true}.
+            if isinstance(v, dict):
+                parts.append(f"{k}:{v.get('port')}{'(tls)' if v.get('tls') else ''}")
+            else:
+                parts.append(f"{k}:{v}")
+    print(" ".join(parts))
 except Exception:
     pass
 PY
