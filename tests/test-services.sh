@@ -93,6 +93,11 @@ mkdir -p "$CONFIG_BASE/services"
 cat > "$CONFIG_BASE/services/myws.json" <<EOF
 {"name": "myws", "workspace": "$WS", "container": "cc-test", "mux_port": $MUX_PORT}
 EOF
+# A hyphenated instance (as the launcher would produce for a dir like my_ws)
+# to exercise underscore-spelling canonicalization.
+cat > "$CONFIG_BASE/services/my-ws.json" <<EOF
+{"name": "my-ws", "workspace": "$WS", "container": "cc-test2", "mux_port": $MUX_PORT}
+EOF
 
 HTTP_PORT=$(free_port)
 ALT_PORT=$(free_port)
@@ -182,6 +187,19 @@ out=$(curl -s "http://127.0.0.1:$fwd/hello.txt")
 assert_eq "raw TCP forward pipes to the service" "$out" "hello-from-web"
 fwd2=$(python3 "$ROUTER" port myws/web)
 assert_eq "port command is idempotent" "$fwd2" "$fwd"
+
+out=$(python3 "$ROUTER" port ghost/web 2>&1 >/dev/null)
+assert_contains "unknown instance fails at allocation time" "$out" "unknown instance 'ghost' (running:"
+
+out=$(curl -s -H "Host: web.my_ws.claude" "http://127.0.0.1:$HTTP_PORT/hello.txt")
+assert_eq "underscore spelling of an instance routes (canonicalized)" "$out" "hello-from-web"
+
+fwd3=$(python3 "$ROUTER" port my_ws/web)
+fwd4=$(python3 "$ROUTER" port my-ws/web)
+assert_eq "underscore and hyphen spellings share one forward" "$fwd3" "$fwd4"
+
+out=$(python3 "$ROUTER" port myws/undeclared 2>&1 >/dev/null)
+assert_contains "undeclared service warns at allocation time" "$out" "not currently declared"
 
 echo "== DNS =="
 

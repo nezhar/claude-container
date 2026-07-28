@@ -45,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 CONFIG_BASE = os.environ.get(
@@ -83,6 +84,13 @@ def service_url(service, instance, suffix="localhost"):
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 HEAD_LIMIT = 65536
+
+
+def canonical_instance(name):
+    """Mirror the launcher's instance-name sanitization (workspace basename,
+    lowercased, non-[a-z0-9-] chars becoming hyphens) so users can type the
+    directory name verbatim: led_mapper resolves to instance led-mapper."""
+    return re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
 
 
 def log(msg):
@@ -137,7 +145,7 @@ def dial_mux(instance, service):
     for a 502 body.
     """
     registry = read_registry()
-    entry = registry.get(instance)
+    entry = registry.get(instance) or registry.get(canonical_instance(instance))
     if entry is None:
         known = ", ".join(sorted(registry)) or "(none)"
         raise RuntimeError(f"unknown instance '{instance}' (running: {known})")
@@ -344,14 +352,45 @@ def handle_api(client, path):
         return
     m = re.match(r"^/\.cc/port/([^/]+)/([^/]+)$", path)
     if m and NAME_RE.match(m.group(1)) and NAME_RE.match(m.group(2)):
-        port = ensure_forwarder(m.group(1), m.group(2))
-        client.sendall(http_response("200 OK", json.dumps({"port": port}), "application/json"))
+        instance, service = m.group(1), m.group(2)
+        # Fail unknown instances at allocation time (a bare port number gives
+        # the user nothing to debug when connections die later), and normalize
+        # the spelling so the forwarder key is canonical.
+        registry = read_registry()
+        if instance not in registry:
+            instance = canonical_instance(instance)
+        entry = registry.get(instance)
+        if entry is None:
+            known = ", ".join(sorted(registry)) or "(none)"
+            client.sendall(http_response(
+                "404 Not Found",
+                json.dumps({"error": f"unknown instance '{m.group(1)}' (running: {known})"}),
+                "application/json",
+            ))
+            return
+        port = ensure_forwarder(instance, service)
+        client.sendall(http_response(
+            "200 OK",
+            json.dumps({
+                "port": port,
+                "instance": instance,
+                "declared": service in instance_services(entry),
+                "declared_services": sorted(instance_services(entry)),
+            }),
+            "application/json",
+        ))
         return
     client.sendall(http_response("404 Not Found", "unknown API path\n"))
 
 
 class HTTPHandler(socketserver.BaseRequestHandler):
     def handle(self):
+        # Listeners created via the wildcard-bind fallback (see cmd_run) are
+        # semantically loopback-only: drop any connection from off-machine.
+        if getattr(self.server, "cc_loopback_only", False):
+            peer = self.client_address[0]
+            if peer != "::1" and not peer.startswith("127."):
+                return
         client = self.request
         client.settimeout(30)
         raw = b""
@@ -524,15 +563,35 @@ def cmd_run():
             continue
         try:
             alt_server = _ThreadingTCPServer((BIND, alt), HTTPHandler)
-            threading.Thread(target=alt_server.serve_forever, daemon=True).start()
-            bound_http_ports.append(alt)
-            if alt == 80:
-                log(f"port 80 bound — portless URLs work: http://<service>.<instance>.{DOMAIN}.localhost/")
+        except PermissionError as exc:
+            # macOS allows unprivileged low-port binds on the WILDCARD address
+            # only, not on 127.0.0.1 specifically. Fall back to a wildcard
+            # listener whose handler drops non-loopback peers, so portless
+            # URLs work without exposing the front door to the LAN.
+            alt_server = None
+            if sys.platform == "darwin" and BIND == "127.0.0.1":
+                try:
+                    alt_server = _ThreadingTCPServer(("0.0.0.0", alt), HTTPHandler)
+                    alt_server.cc_loopback_only = True
+                except OSError as exc2:
+                    exc = exc2
+            if alt_server is None:
+                hint = ""
+                if alt == 80 and sys.platform.startswith("linux"):
+                    hint = " (enable with: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80)"
+                log(f"HTTP alt port {BIND}:{alt} unavailable: {exc}{hint}; URLs need :{HTTP_PORT}")
+                continue
         except OSError as exc:
             hint = ""
             if alt == 80 and sys.platform.startswith("linux"):
                 hint = " (enable with: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80)"
             log(f"HTTP alt port {BIND}:{alt} unavailable: {exc}{hint}; URLs need :{HTTP_PORT}")
+            continue
+        threading.Thread(target=alt_server.serve_forever, daemon=True).start()
+        bound_http_ports.append(alt)
+        if alt == 80:
+            extra = " (wildcard bind, loopback-only enforced)" if getattr(alt_server, "cc_loopback_only", False) else ""
+            log(f"port 80 bound{extra} — portless URLs work: http://<service>.<instance>.{DOMAIN}.localhost/")
     dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -647,11 +706,27 @@ def cmd_port(spec):
         with urllib.request.urlopen(
             f"http://{BIND}:{HTTP_PORT}/.cc/port/{m.group(1)}/{m.group(2)}", timeout=5
         ) as resp:
-            print(json.load(resp)["port"])
-            return 0
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            msg = json.load(exc).get("error", str(exc))
+        except Exception:
+            msg = str(exc)
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
     except Exception as exc:
         print(f"error: could not allocate forward: {exc}", file=sys.stderr)
         return 1
+    print(data["port"])
+    if not data.get("declared", True):
+        declared = ", ".join(data.get("declared_services", [])) or "(none)"
+        print(
+            f"note: '{m.group(2)}' is not currently declared in "
+            f"{data.get('instance', m.group(1))}'s overlay.json "
+            f"(declared: {declared}); the forward will work once it is.",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def main():

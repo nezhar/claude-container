@@ -230,9 +230,10 @@ launch), gives every instance's services stable names:
 
 The portless forms work because the router binds port 80 in addition to its
 primary port (8484) whenever it can: out of the box on macOS (unprivileged
-low-port binds are allowed since 10.14) and on Linux after
-`sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` (persist it in
-`/etc/sysctl.d/` to survive reboots). If port 80 is unavailable — e.g. a local
+low-port binds are allowed since 10.14 — but only on the wildcard address, so
+the router falls back to a wildcard listener that drops non-loopback peers)
+and on Linux after `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80`
+(persist it in `/etc/sysctl.d/` to survive reboots). If port 80 is unavailable — e.g. a local
 nginx owns it — the router logs a note and everything works with `:8484`
 appended; `claude-container --services` always prints the exact working URLs.
 HTTPS is not terminated (that would need a locally trusted CA à la `mkcert`);
