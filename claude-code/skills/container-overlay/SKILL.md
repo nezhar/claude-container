@@ -1,6 +1,6 @@
 ---
 name: container-overlay
-description: Persist tools you needed inside the claude-container so they're available next launch. Use whenever you ran apt-get install, configured a global utility (Nix/Homebrew/asdf/cargo install -g, system Python packages), or otherwise mutated the container in a way that should survive a restart. Append to `.claude-container-overlay/Dockerfile` at the workspace root (and declare ports in `overlay.json`) — the launcher rebuilds the image with that fragment appended on the next run.
+description: Persist tools you needed inside the claude-container so they're available next launch, and expose in-container servers to the host. Use whenever you ran apt-get install, configured a global utility (Nix/Homebrew/asdf/cargo install -g, system Python packages), mutated the container in a way that should survive a restart, or started a server (dashboard, dev server, API) the user should be able to open. Append to `.claude-container-overlay/Dockerfile` at the workspace root, declare fixed ports in `overlay.json` "ports", or — preferred for HTTP servers — declare NAMED services in `overlay.json` "services" (reachable immediately, no restart, no port collisions across containers).
 ---
 
 # claude-container overlay
@@ -14,14 +14,14 @@ You almost never need to ask the user before doing this — if you just ran `apt
 ```
 .claude-container-overlay/
 ├── Dockerfile      # build fragment, appended to the base image (no FROM line)
-├── overlay.json    # structured runtime config: {"ports": [...]}
+├── overlay.json    # structured runtime config: {"ports": [...], "services": {...}}
 └── skills/<name>/  # proposed skills — see the container-skills skill
 ```
 
 All three parts are optional; create only what you need. The directory can be committed to the repo.
 
 - **`Dockerfile`** — a fragment concatenated after `FROM <base-image>` during `docker build`. It executes **as root** at build time (the entrypoint switches users at runtime). The overlay directory is the **build context**, so `COPY someconf /etc/someconf` works for files you place next to the Dockerfile.
-- **`overlay.json`** — runtime configuration the launcher reads. Currently: a `ports` array of mappings passed straight to `docker run -p`.
+- **`overlay.json`** — runtime configuration the launcher reads: a `ports` array of mappings passed straight to `docker run -p`, and a `services` object naming in-container ports (see Named services below).
 - **`skills/`** — skill proposals; deployed at launch, never baked into the image. Covered by the `container-skills` skill, not this one.
 
 A legacy form — `.claude-container-overlay` as a single Dockerfile-fragment *file* with `# claude-container:port <mapping>` comments — still works. If you find one, migrate it: `mkdir` the directory, move the fragment to `Dockerfile` (dropping the port comments), and convert the port comments into `overlay.json`.
@@ -36,9 +36,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ```
 
-## Port forwarding
+## Named services (preferred for HTTP servers)
 
-To make a dev server, web UI, or debugger inside the container reachable from the host, declare mappings in `overlay.json`:
+When you start a web dashboard, dev server, or API inside the container that the user should be able to open, declare it by **name** in `overlay.json`:
+
+```json
+{
+  "services": {"dashboard": 8099, "api": 8080}
+}
+```
+
+The value is the in-container port; the entry takes effect **immediately** (no restart) and the user opens `http://dashboard.$CLAUDE_SERVICE_INSTANCE.claude.localhost/`. This is covered in full — URL forms, in-container verification, and migrating old `"ports"` entries — by the **`container-services`** skill; use that one when exposing a server. Use `"ports"` (below) only when something genuinely needs a **fixed, well-known host port** (an external device calls back in, a config file hardcodes the port, or UDP is involved).
+
+## Fixed port forwarding
+
+For a fixed host port, declare mappings in `overlay.json`:
 
 ```json
 {
@@ -46,7 +58,7 @@ To make a dev server, web UI, or debugger inside the container reachable from th
 }
 ```
 
-Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. `overlay.json` is excluded from the image hash, so **adding, changing, or removing a port mapping never triggers a rebuild** — it only changes the `-p` flags on the next `docker run`.
+Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. Fixed mappings take effect at the **next launch** and collide if another running container claims the same host port. `overlay.json` is excluded from the image hash, so **changing ports or services never triggers a rebuild** — ports only change the `-p` flags on the next `docker run`; services apply live.
 
 ## When to add a Dockerfile entry
 
@@ -143,7 +155,7 @@ When `claude-container` starts in a workspace containing `.claude-container-over
 2. Hashes the base image tag + `Dockerfile` + any other files in the directory (excluding `overlay.json` and `skills/`).
 3. Looks for a local image tagged `claude-container-overlay:<hash>`.
 4. If it exists, uses it. If not, builds it: `FROM <base-image>` followed by the fragment, with the overlay directory as build context.
-5. Runs the container as usual against that image, adding the `-p` flags.
+5. Runs the container as usual against that image, adding the `-p` flags plus a single ephemeral publish of the service mux (which backs named services).
 
 Because the tag is content-addressed, switching branches that have different overlays just switches images — no rebuild needed if you've used that overlay before.
 

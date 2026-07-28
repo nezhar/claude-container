@@ -26,6 +26,12 @@ _claude_container_completion() {
         --skills-accept
         --skills-reject
         --skills-reset
+        --services
+        --service-port
+        --router-start
+        --router-stop
+        --router-status
+        --router-logs
         --pull
         --shell
         --tmux
@@ -43,7 +49,7 @@ _claude_container_completion() {
     local skill_flags="--skills-adopt --skills-drop --skills-accept --skills-reject"
 
     # Flags that don't take arguments (actions)
-    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --skills --skills-reset --pull --shell --tmux --version -v --help -h"
+    local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --skills --skills-reset --services --router-start --router-stop --router-status --router-logs --pull --shell --tmux --version -v --help -h"
 
     case "$prev" in
         --workspace|-w|--config|-c|--proxy-data)
@@ -70,6 +76,27 @@ _claude_container_completion() {
             if [[ -d "$user_skills_dir" ]]; then
                 COMPREPLY=($(compgen -W "$(command ls -1 "$user_skills_dir" 2>/dev/null)" -- "$cur"))
             fi
+            return 0
+            ;;
+        --service-port)
+            # Complete with <instance>/<service> from registered instances
+            local services_dir="$HOME/.config/claude-container/services" specs="" reg
+            for reg in "$services_dir"/*.json; do
+                [[ -f "$reg" ]] || continue
+                specs+=" $(python3 - "$reg" 2>/dev/null <<'PY'
+import json, os, sys
+entry = json.load(open(sys.argv[1]))
+overlay = os.path.join(entry.get("workspace", ""), ".claude-container-overlay", "overlay.json")
+try:
+    services = json.load(open(overlay)).get("services", {})
+except Exception:
+    services = {}
+for svc in services:
+    print(f"{entry.get('name', '?')}/{svc}")
+PY
+)"
+            done
+            COMPREPLY=($(compgen -W "$specs" -- "$cur"))
             return 0
             ;;
     esac

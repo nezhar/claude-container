@@ -69,4 +69,14 @@ if [ -d "$SKILL_SRC" ]; then
     chown -R "$USER_UID:$USER_GID" "$SKILL_DEST"
 fi
 
+# Named-service mux: tunnels connections on its single port to in-container
+# service ports declared in the workspace overlay's overlay.json ("services").
+# The launcher publishes the mux port on an ephemeral host port and the host's
+# claude-container-router routes to services through it by name. overlay.json is
+# re-read per connection, so services declared mid-session need no restart.
+# Runs as the mapped user; survives the exec below as a child of PID 1.
+if [ -x /usr/local/bin/svc-mux ] && command -v python3 >/dev/null 2>&1; then
+    gosu "$USER_NAME" /usr/local/bin/svc-mux >/tmp/svc-mux.log 2>&1 &
+fi
+
 exec gosu "$USER_NAME" "$@"

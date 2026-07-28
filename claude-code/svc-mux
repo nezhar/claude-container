@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""In-container service mux for claude-container named-service forwarding.
+
+The launcher publishes exactly one container port (this mux) on an ephemeral
+host port, so any number of container instances (e.g. one per git worktree) can
+run concurrently without their port forwards colliding. Multiple in-container
+services are tunneled through it by name:
+
+    client -> connect -> "<service>\n" -> "OK <port>\n" -> raw byte splice
+                                       -> "ERR <message>\n" + close on failure
+
+Service names resolve through the workspace overlay's runtime config,
+/workspace/.claude-container-overlay/overlay.json:
+
+    {"services": {"dashboard": 8099, "api": 8080}}
+
+The file is re-read on every connection, so services declared mid-session (for
+example by Claude building a new dashboard) become reachable immediately — no
+container restart. The host-side counterpart is claude-container-router, which
+speaks this preamble protocol to route HTTP by name and to allocate raw TCP
+forwards (claude-container --service-port <instance>/<service>).
+"""
+
+import json
+import os
+import re
+import socket
+import socketserver
+import sys
+import threading
+
+OVERLAY_JSON = os.environ.get(
+    "CLAUDE_SVC_OVERLAY_JSON", "/workspace/.claude-container-overlay/overlay.json"
+)
+MUX_PORT = int(os.environ.get("CLAUDE_SVC_MUX_PORT", "7999"))
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+MAX_PREAMBLE = 256
+
+
+def resolve_service(name):
+    """Return the local port for a service name, or raise ValueError."""
+    if not NAME_RE.match(name):
+        raise ValueError(f"invalid service name {name!r}")
+    try:
+        with open(OVERLAY_JSON) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"no overlay.json at {OVERLAY_JSON}")
+    except Exception as exc:
+        raise ValueError(f"could not parse overlay.json: {exc}")
+    services = data.get("services") if isinstance(data, dict) else None
+    if not isinstance(services, dict):
+        raise ValueError('overlay.json has no "services" object')
+    port = services.get(name)
+    if isinstance(port, str) and port.isdigit():
+        port = int(port)
+    if not isinstance(port, int) or not (0 < port < 65536):
+        known = ", ".join(sorted(k for k in services if isinstance(k, str))) or "(none)"
+        raise ValueError(f"unknown service {name!r} (declared: {known})")
+    return port
+
+
+def read_line(sock, limit):
+    """Read up to a newline, byte-at-a-time (the preamble is tiny)."""
+    buf = bytearray()
+    while len(buf) < limit:
+        b = sock.recv(1)
+        if not b:
+            break
+        if b == b"\n":
+            return bytes(buf).decode("ascii", "replace").strip()
+        buf += b
+    raise ValueError("preamble line too long or connection closed")
+
+
+def splice(a, b):
+    """Pump bytes a->b until EOF, then half-close b."""
+    try:
+        while True:
+            data = a.recv(65536)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+class MuxHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client = self.request
+        try:
+            name = read_line(client, MAX_PREAMBLE)
+            port = resolve_service(name)
+            upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
+        except (ValueError, OSError) as exc:
+            try:
+                client.sendall(f"ERR {exc}\n".encode())
+            except OSError:
+                pass
+            return
+        upstream.settimeout(None)
+        try:
+            client.sendall(f"OK {port}\n".encode())
+        except OSError:
+            upstream.close()
+            return
+        t = threading.Thread(target=splice, args=(upstream, client), daemon=True)
+        t.start()
+        splice(client, upstream)
+        t.join()
+        upstream.close()
+
+
+class MuxServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+    # 0.0.0.0: docker's port publish reaches us via the container's bridge
+    # interface; the launcher only ever publishes to the host's 127.0.0.1.
+    server = MuxServer(("0.0.0.0", MUX_PORT), MuxHandler)
+    print(f"svc-mux listening on :{MUX_PORT}, services from {OVERLAY_JSON}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
