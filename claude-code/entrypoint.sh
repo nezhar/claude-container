@@ -50,4 +50,23 @@ fi
 
 export SHELL=/bin/bash
 export HOME="${USER_HOME:-/home/claude}"
+
+# Deploy the skills baked into the image (see Dockerfile / skills/) into Claude's
+# skills directory so they're available in every workspace without per-project
+# provisioning. Refreshed on every start so they always match the image version.
+#
+# Deploy ONLY into Claude's actual config dir ($CLAUDE_CONFIG_DIR, normally the
+# bind-mounted /claude). Do NOT create $HOME/.claude: when CLAUDE_CONFIG_DIR is
+# relocated, a stray ~/.claude makes Claude treat the run as a fresh install and
+# re-prompt for bypass-permissions/trust acceptance (the acceptance state lives in
+# <config-dir>/.claude.json). We only touch the skills subdir, never the config
+# files alongside it.
+SKILL_SRC=/opt/claude-container/skills
+SKILL_DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+if [ -d "$SKILL_SRC" ]; then
+    mkdir -p "$SKILL_DEST"
+    cp -a "$SKILL_SRC/." "$SKILL_DEST/"
+    chown -R "$USER_UID:$USER_GID" "$SKILL_DEST"
+fi
+
 exec gosu "$USER_NAME" "$@"

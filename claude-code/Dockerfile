@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zip \
         unzip \
         xz-utils \
+        tmux \
         build-essential \
         python3 \
         python3-distutils-extra \
@@ -78,6 +79,21 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# claude-tmux: wrapper that launches Claude inside a named tmux session (used by
+# `claude-container --tmux`).
+COPY claude-tmux /usr/local/bin/claude-tmux
+RUN chmod +x /usr/local/bin/claude-tmux
+
+# Bundled Claude Code skills. Baked into the image here; the entrypoint deploys
+# them into the user's skills directory at startup so they're available in every
+# workspace without per-project provisioning.
+COPY skills/ /opt/claude-container/skills/
+
+# UTF-8 locale (glibc's built-in C.utf8) — without it tmux assumes a non-UTF-8
+# terminal and renders all non-ASCII output as underscores. Kept last so the
+# layer cache above is unaffected.
+ENV LANG=C.UTF-8
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
