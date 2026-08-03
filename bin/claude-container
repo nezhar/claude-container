@@ -204,6 +204,14 @@ WORKSPACE OVERLAY:
     file with "# claude-container:port <mapping>" directive comments — is still
     supported.
 
+GIT WORKTREES:
+    A workspace that is a linked git worktree keeps its repository (objects,
+    refs, index) in the main checkout's .git directory, outside the workspace.
+    The launcher detects this and bind-mounts the main repository's .git
+    directory into the container at the path the worktree's pointer expects,
+    so git works normally inside. Run one container per worktree freely — they
+    share the main .git the same way concurrent worktrees do on the host.
+
 BUNDLED SKILLS:
     The image ships with Claude Code skills baked in (container-overlay,
     container-tmux, container-skills, container-services). They are deployed
@@ -661,6 +669,90 @@ skills_reset() {
     else
         echo -e "${BLUE}No skill choices recorded for this project.${NC}"
     fi
+    return 0
+}
+
+# --- Git worktree support -----------------------------------------------------
+#
+# A linked git worktree keeps only a pointer in the workspace: .git is a FILE
+# containing "gitdir: <main-repo>/.git/worktrees/<name>", and the repository
+# proper (objects, refs, config, plus the worktree's own index/HEAD) lives in
+# the main repository's .git directory OUTSIDE the workspace. Mounting just the
+# worktree therefore leaves git in the container with a dangling pointer
+# ("fatal: not a git repository").
+#
+# Fix: bind-mount the main repository's .git directory at the path the pointer
+# resolves to INSIDE the container, so .git -> gitdir -> commondir all resolve
+# unchanged. With the usual absolute pointer that is the same absolute path as
+# on the host; with a relative pointer (worktree.useRelativePaths) it is the
+# path resolved against /workspace. Mounted read-write — commits from the
+# worktree write objects and refs there. Submodule workspaces (.git pointing at
+# <parent>/.git/modules/<path>, no commondir file) get the same treatment.
+setup_worktree_git_mount() {
+    local gitfile pointer host_gitdir host_common commonrel target
+    gitfile="$WORKSPACE_DIR/.git"
+    if [ ! -f "$gitfile" ]; then
+        return 0  # a directory (regular repo) or absent: nothing to do
+    fi
+    pointer=$(sed -n 's/^gitdir:[[:space:]]*//p' "$gitfile" | head -1)
+    if [ -z "$pointer" ]; then
+        return 0
+    fi
+    case "$pointer" in
+        /*) host_gitdir="$pointer" ;;
+        *)  host_gitdir="$WORKSPACE_DIR/$pointer" ;;
+    esac
+    if ! host_gitdir="$(cd "$host_gitdir" 2>/dev/null && pwd)"; then
+        echo -e "${YELLOW}Warning: $gitfile points at '$pointer', which doesn't resolve on the host; git won't work in the container.${NC}"
+        return 0
+    fi
+    # The directory to mount: the main repo's .git for worktrees (commondir is
+    # normally '../..' from .git/worktrees/<name>); the module gitdir itself
+    # for submodules (no commondir file).
+    host_common="$host_gitdir"
+    commonrel=""
+    if [ -f "$host_gitdir/commondir" ]; then
+        commonrel="$(head -1 "$host_gitdir/commondir")"
+        case "$commonrel" in
+            /*) host_common="$commonrel" ;;
+            *)  host_common="$host_gitdir/$commonrel" ;;
+        esac
+        if ! host_common="$(cd "$host_common" 2>/dev/null && pwd)"; then
+            echo -e "${YELLOW}Warning: could not resolve the git commondir behind $gitfile; git won't work in the container.${NC}"
+            return 0
+        fi
+    fi
+    case "$host_common" in
+        "$WORKSPACE_DIR"/*) return 0 ;;  # inside the workspace mount already
+    esac
+    case "$pointer" in
+        /*)
+            # Absolute pointer: the container must see the same absolute path.
+            target="$host_common"
+            ;;
+        *)
+            # Relative pointer: it resolves against /workspace in the
+            # container. Replay the pointer + commondir walk from /workspace
+            # and normalize (the resulting path exists only in the container).
+            if ! command -v python3 >/dev/null 2>&1; then
+                echo -e "${YELLOW}Warning: python3 not found; cannot map the relative gitdir pointer in $gitfile. Git won't work in the container.${NC}"
+                return 0
+            fi
+            target=$(CC_POINTER="$pointer" CC_COMMONREL="$commonrel" python3 - <<'PY'
+import os
+path = os.path.normpath(os.path.join("/workspace", os.environ["CC_POINTER"]))
+common = os.environ["CC_COMMONREL"]
+if os.path.isabs(common):
+    path = common
+elif common:
+    path = os.path.normpath(os.path.join(path, common))
+print(path)
+PY
+)
+            ;;
+    esac
+    EXTRA_DOCKER_ARGS+=(-v "$host_common:$target")
+    echo -e "${GREEN}Git worktree workspace — also mounting the main repo's git dir:${NC} ${YELLOW}$host_common${NC}"
     return 0
 }
 
@@ -1220,6 +1312,10 @@ CONFIG_DIR="$(cd "$CONFIG_DIR" && pwd)" 2>/dev/null || CONFIG_DIR="$(mkdir -p "$
 
 # Always disable Claude's permission prompts for this sandboxed container.
 ensure_bypass_permissions
+
+# Workspaces that are linked git worktrees (or submodules) need the main
+# repository's git dir mounted too — see setup_worktree_git_mount.
+setup_worktree_git_mount
 
 # Named-service identity for this launch: a stable, readable instance name (for
 # service URLs) and a unique container name (so concurrent launches — one per

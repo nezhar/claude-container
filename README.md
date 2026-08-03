@@ -452,6 +452,12 @@ docker compose --profile tools run claude-code claude
 
 This approach keeps Claude Code separate from your main application services while allowing easy access when needed.
 
+## Git Worktrees
+
+Running `claude-container` inside a [linked git worktree](https://git-scm.com/docs/git-worktree) just works. A worktree's `.git` is a pointer file into the main checkout's `.git` directory, which lives outside the workspace — so mounting the worktree alone would leave git in the container with a dangling pointer (`fatal: not a git repository`). The launcher detects this and additionally bind-mounts the main repository's `.git` directory at the path the pointer expects inside the container.
+
+This pairs naturally with named services: run one container per worktree and they share the main repository's `.git` exactly as concurrent worktrees do on the host, while their services stay separately addressable per instance.
+
 ## API Request Logging Proxy
 
 This repository includes an optional logging proxy that captures all Anthropic API requests and responses to a SQLite database. This is useful for:
