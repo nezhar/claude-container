@@ -47,7 +47,7 @@ When using all three images together, the request flow looks like this:
 
 ## Compatibility Matrix
 
-**Latest Release:** 1.6.12 (Claude Code 2.1.69)
+**Latest Release:** 1.7.0 (Claude Code 2.1.181)
 
 | Container Version | Claude Code Version |
 |-------------------|---------------------|
@@ -58,6 +58,7 @@ When using all three images together, the request flow looks like this:
 | 1.4.x             | 2.0.x               |
 | 1.5.x             | 2.1.x               |
 | 1.6.x             | 2.1.x               |
+| 1.7.x             | 2.1.x               |
 
 ## Quick Start
 
@@ -160,11 +161,12 @@ project-specific state on top of it **persistently**, create a
 ```
 .claude-container-overlay/
 ├── Dockerfile      # build fragment appended to the base image
-├── overlay.json    # structured runtime config (ports, ...)
+├── overlay.json    # structured runtime config (ports, runtime flags, ...)
+├── startup.sh      # optional hook, run once per container start
 └── skills/<name>/  # skills proposed from inside the container (see below)
 ```
 
-All three parts are optional — create only what you need, and commit the
+All four parts are optional — create only what you need, and commit the
 directory to the repo if the whole team should share it.
 
 **`Dockerfile`** is a fragment (no `FROM` line) that the launcher appends to the
@@ -195,8 +197,63 @@ forwarding and named services (see the next section for the latter):
 
 Each `ports` entry is passed straight to `docker run -p`, so any value Docker
 accepts works (`host:container`, `ip:host:container`, a bare container port, or
-a `/udp` suffix). `overlay.json` and `skills/` are excluded from the image hash,
-so changing ports, services, or skills never triggers a rebuild.
+a `/udp` suffix). `overlay.json`, `startup.sh` and `skills/` are excluded from
+the image hash, so changing ports, services, the startup hook, or skills never
+triggers a rebuild.
+
+#### Runtime flags
+
+Some projects need the container itself to be built differently at run time — a
+kernel capability, a device node, a sysctl, an environment variable. Four more
+`overlay.json` keys cover that:
+
+```json
+{
+  "capabilities": ["NET_ADMIN"],
+  "devices": ["/dev/net/tun", "/dev/bus/usb:/dev/bus/usb:rwm"],
+  "sysctls": {"net.ipv4.ip_forward": 1},
+  "env": ["TS_AUTHKEY", "TS_HOSTNAME=worker-1"]
+}
+```
+
+| Key | Becomes | Notes |
+| --- | --- | --- |
+| `capabilities` | `--cap-add` | Capability names, with or without the `CAP_` prefix. `ALL` is refused. |
+| `devices` | `--device` | `host[:container[:perms]]`; both paths must be under `/dev/`. |
+| `sysctls` | `--sysctl` | Only container-namespaced sysctls (`net.*`, `fs.mqueue.*`, `kernel.msg*`, `kernel.sem`, `kernel.shm*`). |
+| `env` | `-e` | A bare `NAME` forwards the value from the launching environment; `NAME=value` sets a literal. |
+
+Unlike `ports`, these are an **allowlist rather than a passthrough**. There is
+deliberately no way to express `-v`, `--privileged`, `--pid=host` or
+`--network=host`: `overlay.json` is committed with the repo and applied silently
+at the next launch, so a cloned — or agent-written — branch must not be able to
+reach out of the container and onto the host. Entries that don't validate are
+skipped with a warning explaining why, and the launch continues.
+
+For secrets, prefer the bare `"NAME"` form. The value is then read from the
+environment that ran `claude-container` and never appears in the container's
+argv (so it stays out of `docker inspect` and `ps`); the launcher masks it in
+its own summary line too.
+
+These are runtime-only, like ports — changing them never triggers a rebuild.
+
+#### Startup hook
+
+`startup.sh` runs once per container start, immediately before Claude. Use it
+for setup that needs the live container rather than an image layer — starting a
+daemon, joining a network, seeding a socket:
+
+```bash
+# .claude-container-overlay/startup.sh
+sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &
+sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$(hostname)"
+```
+
+It runs to completion (not backgrounded), so an unattended agent starts with the
+setup already done. It runs as the mapped non-root user — a hook that needs root
+should use `sudo`, which the overlay `Dockerfile` has to install and grant
+deliberately. A hook that fails or exceeds the timeout (120s by default,
+`CLAUDE_STARTUP_TIMEOUT` to change) warns and lets the session continue.
 
 **Legacy form:** a single `.claude-container-overlay` *file* (a Dockerfile
 fragment with `# claude-container:port <mapping>` directive comments) is still

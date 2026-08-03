@@ -26,7 +26,7 @@ set -e
 
 # Version information
 # Container and proxy are always released with the same version
-VERSION="1.6.12"
+VERSION="1.7.0"
 
 # Default values
 WORKSPACE_DIR="$(pwd)"
@@ -55,6 +55,10 @@ SHELL_MODE=false
 TMUX_MODE=false
 # Port mappings published from the workspace overlay (docker run -p args)
 PORT_ARGS=()
+# Runtime docker flags from the workspace overlay's overlay.json — --cap-add,
+# --device, --sysctl and -e, built from an ALLOWLIST (see the overlay parsing
+# below for why it is an allowlist and not a passthrough).
+OVERLAY_RUNTIME_ARGS=()
 # Extra docker run args assembled at launch time (e.g. tmux mount + env)
 EXTRA_DOCKER_ARGS=()
 # Skill sharing: agents inside the container propose skills into the workspace's
@@ -197,13 +201,36 @@ WORKSPACE OVERLAY:
         ├── overlay.json    Structured runtime config:
         │                   {"ports": ["8080:8080"], "services": {"web": 8099}}
         │                   "ports" entries go straight to "docker run -p";
-        │                   "services" declares NAMED services (see below).
+        │                   "services" declares NAMED services (see below);
+        │                   "capabilities"/"devices"/"sysctls"/"env" add
+        │                   --cap-add/--device/--sysctl/-e (see below).
+        ├── startup.sh      Optional hook run once per container start, just
+        │                   before Claude — for setup that needs the live
+        │                   container (start a daemon, join a network).
         └── skills/<name>/  Skills proposed by Claude from inside the container
                             (deployed at launch, never baked into the image).
 
     The built image is tagged claude-container-overlay:<hash> over the base
-    image plus the build inputs; overlay.json and skills/ are excluded from the
-    hash, so port/skill changes never trigger a rebuild.
+    image plus the build inputs; overlay.json, startup.sh and skills/ are
+    excluded from the hash, so changes to them never trigger a rebuild.
+
+    RUNTIME FLAGS are an allowlist, not a passthrough — there is deliberately
+    no way to express -v, --privileged, --pid=host or --network=host, because
+    overlay.json is committed with the repo and applied silently at the next
+    launch. Invalid entries are skipped with a warning; the launch continues.
+
+        "capabilities": ["NET_ADMIN"]              --cap-add (ALL is refused)
+        "devices":      ["/dev/net/tun"]           --device  (paths under /dev/)
+        "sysctls":      {"net.ipv4.ip_forward": 1} --sysctl  (namespaced only)
+        "env":          ["TS_AUTHKEY"]             -e
+
+    A bare "env" name forwards the value from the launching environment and
+    keeps it out of the container's argv — prefer it for secrets. "NAME=value"
+    sets a literal.
+
+    startup.sh runs to completion as the mapped non-root user (use sudo if it
+    needs root), under a timeout (CLAUDE_STARTUP_TIMEOUT, default 120s). A hook
+    that fails or times out warns and lets the session continue.
 
     The legacy form — a single .claude-container-overlay Dockerfile-fragment
     file with "# claude-container:port <mapping>" directive comments — is still
@@ -1399,8 +1426,116 @@ suggest_adoptable_skills
 #
 # The overlay image is tagged with a content hash of (base image + build inputs)
 # so switching branches that have different overlays just switches images.
-# Runtime-only inputs (overlay.json, skills/) are excluded from the hash, so
-# changing ports or skills never triggers a rebuild.
+# Runtime-only inputs (overlay.json, startup.sh, skills/) are excluded from the
+# hash, so changing ports, runtime flags, the startup hook or skills never
+# triggers a rebuild.
+# Translate the allowlisted runtime keys of an overlay.json into docker run
+# arguments, one per line. Kept in a function because the parser is a heredoc:
+# bash 3.2 (macOS's system bash) looks for the closing paren of a process
+# substitution without skipping heredoc bodies, so inlining it under <(...)
+# fails to parse there.
+overlay_runtime_args() {
+    OVERLAY_JSON="$1" python3 - <<'PY'
+import json, os, re, sys
+
+path = os.environ["OVERLAY_JSON"]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    # The ports pass above already reported the parse failure.
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+
+
+def warn(msg):
+    print(f"Warning: {path}: {msg}", file=sys.stderr)
+
+
+def as_list(value, key):
+    """Accept a bare string as a one-element list, like "ports" does."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return value
+    warn(f'"{key}" must be a list; ignoring it.')
+    return []
+
+
+out = []
+
+for cap in as_list(data.get("capabilities", []), "capabilities"):
+    if not isinstance(cap, str):
+        warn(f"ignoring non-string capability {cap!r}.")
+        continue
+    name = cap.strip().upper()
+    if name in ("ALL", "CAP_ALL"):
+        warn('refusing "ALL" in "capabilities" — list the specific capabilities the project needs.')
+        continue
+    if not re.fullmatch(r"(CAP_)?[A-Z0-9_]+", name):
+        warn(f"ignoring malformed capability {cap!r}.")
+        continue
+    out += ["--cap-add", name]
+
+for dev in as_list(data.get("devices", []), "devices"):
+    if not isinstance(dev, str):
+        warn(f"ignoring non-string device {dev!r}.")
+        continue
+    spec = dev.strip()
+    parts = spec.split(":")
+    if len(parts) > 3:
+        warn(f"ignoring malformed device {dev!r} (expected host[:container[:perms]]).")
+        continue
+    # Both the host and container paths must name a device node, so a device
+    # entry can't be repurposed into a bind mount of an arbitrary host path.
+    bad = [p for p in parts[:2] if not p.startswith("/dev/") or ".." in p.split("/")]
+    if bad:
+        warn(f"ignoring device {dev!r} — paths must be under /dev/ and free of '..'.")
+        continue
+    if len(parts) == 3 and not re.fullmatch(r"[rwm]{1,3}", parts[2]):
+        warn(f"ignoring device {dev!r} — permissions must be a combination of r, w and m.")
+        continue
+    out += ["--device", spec]
+
+# Docker only permits sysctls that are namespaced to the container; anything
+# else would be a host-wide setting and is rejected by the daemon anyway.
+SYSCTL_PREFIXES = ("net.", "fs.mqueue.", "kernel.msg", "kernel.sem", "kernel.shm")
+sysctls = data.get("sysctls", {})
+if not isinstance(sysctls, dict):
+    warn('"sysctls" must be an object of name -> value; ignoring it.')
+    sysctls = {}
+for name, value in sysctls.items():
+    if not isinstance(name, str) or not name.startswith(SYSCTL_PREFIXES):
+        warn(f"ignoring sysctl {name!r} — only container-namespaced sysctls are allowed "
+             f"({', '.join(SYSCTL_PREFIXES)}).")
+        continue
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        warn(f"ignoring sysctl {name!r} — value must be a string or number.")
+        continue
+    out += ["--sysctl", f"{name}={value}"]
+
+for entry in as_list(data.get("env", []), "env"):
+    if not isinstance(entry, str):
+        warn(f"ignoring non-string env entry {entry!r}.")
+        continue
+    name, sep, _ = entry.strip().partition("=")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        warn(f"ignoring malformed env entry {entry!r}.")
+        continue
+    if sep:
+        out += ["-e", entry.strip()]
+    elif name in os.environ:
+        out += ["-e", name]
+    else:
+        warn(f'"{name}" is declared in "env" but is unset in the launching environment; '
+             f"the container will not see it.")
+
+for arg in out:
+    print(arg)
+PY
+}
+
 OVERLAY_PATH="$WORKSPACE_DIR/.claude-container-overlay"
 PORT_MAPPINGS=()
 OVERLAY_BUILD=""
@@ -1432,8 +1567,32 @@ for port in ports:
         print(port.strip())
 PY
 )
+            # Runtime docker flags. Unlike "ports", these are ALLOWLISTED and
+            # validated rather than forwarded verbatim: overlay.json is
+            # committed with the repo and applied silently at the next launch,
+            # so a cloned — or agent-written — branch must not be able to reach
+            # the host with -v /:/host, --privileged or --pid=host. Each key
+            # maps to exactly one docker flag:
+            #
+            #   "capabilities": ["NET_ADMIN"]               --cap-add NET_ADMIN
+            #   "devices":      ["/dev/net/tun"]            --device /dev/net/tun
+            #   "sysctls":      {"net.ipv4.ip_forward": 1}  --sysctl net.ipv4.ip_forward=1
+            #   "env":          ["TS_AUTHKEY"]              -e TS_AUTHKEY
+            #
+            # An "env" entry with no "=" forwards the variable BY NAME, so its
+            # value comes from the launching environment and never appears in
+            # the container's argv (keeps secrets out of `ps`). The "NAME=value"
+            # form is accepted too, for non-secret values.
+            #
+            # Like ports, these are runtime-only: overlay.json is excluded from
+            # the image hash, so changing them never triggers a rebuild.
+            while IFS= read -r runtime_arg; do
+                if [ -n "$runtime_arg" ]; then
+                    OVERLAY_RUNTIME_ARGS+=("$runtime_arg")
+                fi
+            done < <(overlay_runtime_args "$OVERLAY_PATH/overlay.json")
         else
-            echo -e "${YELLOW}Warning: python3 not found; ignoring ports in overlay.json.${NC}"
+            echo -e "${YELLOW}Warning: python3 not found; ignoring ports and runtime flags in overlay.json.${NC}"
         fi
     fi
 
@@ -1471,6 +1630,22 @@ fi
 
 if [ ${#PORT_MAPPINGS[@]} -gt 0 ]; then
     echo -e "${GREEN}Publishing overlay ports:${NC} ${YELLOW}${PORT_MAPPINGS[*]}${NC}"
+fi
+
+if [ ${#OVERLAY_RUNTIME_ARGS[@]} -gt 0 ]; then
+    # Mask the value of a literal "-e NAME=value" so a secret written into
+    # overlay.json isn't echoed to the terminal. (The by-name form, which is
+    # what secrets should use, has no value to mask.)
+    RUNTIME_SUMMARY=""
+    prev_runtime_arg=""
+    for runtime_arg in "${OVERLAY_RUNTIME_ARGS[@]}"; do
+        if [ "$prev_runtime_arg" = "-e" ] && [[ "$runtime_arg" == *=* ]]; then
+            runtime_arg="${runtime_arg%%=*}=***"
+        fi
+        RUNTIME_SUMMARY+="${RUNTIME_SUMMARY:+ }$runtime_arg"
+        prev_runtime_arg="$runtime_arg"
+    done
+    echo -e "${GREEN}Overlay runtime flags:${NC} ${YELLOW}${RUNTIME_SUMMARY}${NC}"
 fi
 
 # Named services declared in overlay.json (display only — resolution happens
@@ -1516,7 +1691,7 @@ if [ -n "$OVERLAY_BUILD" ]; then
         OVERLAY_HASH=$({
             printf '%s\n' "$IMAGE" "$BASE_IMAGE_KEY"
             printf '%s' "$OVERLAY_BUILD"
-            (cd "$OVERLAY_CONTEXT" && find . -type f ! -name Dockerfile ! -name overlay.json ! -path './skills/*' | LC_ALL=C sort | while IFS= read -r ctx_file; do
+            (cd "$OVERLAY_CONTEXT" && find . -type f ! -name Dockerfile ! -name overlay.json ! -name startup.sh ! -path './skills/*' | LC_ALL=C sort | while IFS= read -r ctx_file; do
                 printf '%s\n' "$ctx_file"
                 cat "$ctx_file"
             done)
@@ -1611,6 +1786,7 @@ if [ "$USE_PROXY" = true ]; then
         -e "CLAUDE_SERVICE_INSTANCE=$SERVICE_INSTANCE" \
         -p "127.0.0.1::${MUX_CONTAINER_PORT}" \
         "${PORT_ARGS[@]}" \
+        "${OVERLAY_RUNTIME_ARGS[@]}" \
         "${EXTRA_DOCKER_ARGS[@]}" \
         "$IMAGE" \
         $COMMAND
@@ -1648,6 +1824,7 @@ else
         -e "CLAUDE_SERVICE_INSTANCE=$SERVICE_INSTANCE" \
         -p "127.0.0.1::${MUX_CONTAINER_PORT}" \
         "${PORT_ARGS[@]}" \
+        "${OVERLAY_RUNTIME_ARGS[@]}" \
         "${EXTRA_DOCKER_ARGS[@]}" \
         "$IMAGE" \
         $COMMAND

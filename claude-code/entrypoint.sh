@@ -10,8 +10,43 @@ set -e
 USER_UID=${USER_UID:-1000}
 USER_GID=${USER_GID:-1000}
 
+# Overlay startup hook: <workspace>/.claude-container-overlay/startup.sh runs
+# once per container start, just before the command. It exists for per-project
+# runtime setup that can't be baked into an image layer because it needs the
+# live container — bringing up a daemon, joining a network, seeding a socket.
+# (Persistent tooling still belongs in the overlay Dockerfile.)
+#
+# Run to COMPLETION rather than backgrounded, so an unattended agent starts with
+# the setup already done — but under a timeout, since a hook that blocks forever
+# would otherwise wedge every launch of that workspace. A failing or timed-out
+# hook warns and continues; the session is still usable, just without whatever
+# the hook provides.
+# CLAUDE_OVERLAY_STARTUP overrides the path, mainly so the hook is testable
+# outside a container.
+OVERLAY_STARTUP=${CLAUDE_OVERLAY_STARTUP:-/workspace/.claude-container-overlay/startup.sh}
+STARTUP_TIMEOUT=${CLAUDE_STARTUP_TIMEOUT:-120}
+
+run_overlay_startup() {
+    [ -f "$OVERLAY_STARTUP" ] || return 0
+    local runner=() status=0
+    if [ "$#" -gt 0 ]; then
+        runner=(gosu "$1")
+    fi
+    echo "Running overlay startup hook: $OVERLAY_STARTUP"
+    # Invoked via bash rather than executed directly: the exec bit is easy to
+    # lose across a checkout, and failing silently on that would be baffling.
+    "${runner[@]}" timeout "$STARTUP_TIMEOUT" bash "$OVERLAY_STARTUP" || status=$?
+    if [ "$status" -eq 124 ]; then
+        echo "Warning: overlay startup hook timed out after ${STARTUP_TIMEOUT}s (set CLAUDE_STARTUP_TIMEOUT to change)." >&2
+    elif [ "$status" -ne 0 ]; then
+        echo "Warning: overlay startup hook exited $status; continuing without it." >&2
+    fi
+    return 0
+}
+
 # Root mode: just run as root.
 if [ "$USER_UID" -eq 0 ]; then
+    run_overlay_startup
     exec "$@"
 fi
 
@@ -78,5 +113,9 @@ fi
 if [ -x /usr/local/bin/svc-mux ] && command -v python3 >/dev/null 2>&1; then
     gosu "$USER_NAME" /usr/local/bin/svc-mux >/tmp/svc-mux.log 2>&1 &
 fi
+
+# Runs as the mapped user, not root: a hook needing privilege should go through
+# sudo, which the overlay Dockerfile has to install and grant deliberately.
+run_overlay_startup "$USER_NAME"
 
 exec gosu "$USER_NAME" "$@"

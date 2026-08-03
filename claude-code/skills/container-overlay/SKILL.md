@@ -1,6 +1,6 @@
 ---
 name: container-overlay
-description: Persist tools you needed inside the claude-container so they're available next launch, and expose in-container servers to the host. Use whenever you ran apt-get install, configured a global utility (Nix/Homebrew/asdf/cargo install -g, system Python packages), mutated the container in a way that should survive a restart, or started a server (dashboard, dev server, API) the user should be able to open. Append to `.claude-container-overlay/Dockerfile` at the workspace root, declare fixed ports in `overlay.json` "ports", or — preferred for HTTP servers — declare NAMED services in `overlay.json` "services" (reachable immediately, no restart, no port collisions across containers).
+description: Persist tools you needed inside the claude-container so they're available next launch, expose in-container servers to the host, and grant the container runtime privileges it lacks. Use whenever you ran apt-get install, configured a global utility (Nix/Homebrew/asdf/cargo install -g, system Python packages), mutated the container in a way that should survive a restart, started a server (dashboard, dev server, API) the user should be able to open, or hit a failure that needs a kernel capability, a device node, a sysctl, or an env var from the host. Append to `.claude-container-overlay/Dockerfile` at the workspace root, declare fixed ports in `overlay.json` "ports", declare NAMED services in `overlay.json` "services" (preferred for HTTP servers — reachable immediately, no restart, no port collisions), add "capabilities"/"devices"/"sysctls"/"env" for runtime docker flags, or add `startup.sh` for setup that must run at every container start.
 ---
 
 # claude-container overlay
@@ -15,13 +15,15 @@ You almost never need to ask the user before doing this — if you just ran `apt
 .claude-container-overlay/
 ├── Dockerfile      # build fragment, appended to the base image (no FROM line)
 ├── overlay.json    # structured runtime config: {"ports": [...], "services": {...}}
+├── startup.sh      # optional hook, run once per container start
 └── skills/<name>/  # proposed skills — see the container-skills skill
 ```
 
-All three parts are optional; create only what you need. The directory can be committed to the repo.
+All four parts are optional; create only what you need. The directory can be committed to the repo.
 
 - **`Dockerfile`** — a fragment concatenated after `FROM <base-image>` during `docker build`. It executes **as root** at build time (the entrypoint switches users at runtime). The overlay directory is the **build context**, so `COPY someconf /etc/someconf` works for files you place next to the Dockerfile.
-- **`overlay.json`** — runtime configuration the launcher reads: a `ports` array of mappings passed straight to `docker run -p`, and a `services` object naming in-container ports (see Named services below).
+- **`overlay.json`** — runtime configuration the launcher reads: a `ports` array of mappings passed straight to `docker run -p`, a `services` object naming in-container ports (see Named services below), and the `capabilities`/`devices`/`sysctls`/`env` runtime flags (see Runtime flags below).
+- **`startup.sh`** — a hook run once per container start, for setup that can't be baked into an image layer (see Startup hook below).
 - **`skills/`** — skill proposals; deployed at launch, never baked into the image. Covered by the `container-skills` skill, not this one.
 
 A legacy form — `.claude-container-overlay` as a single Dockerfile-fragment *file* with `# claude-container:port <mapping>` comments — still works. If you find one, migrate it: `mkdir` the directory, move the fragment to `Dockerfile` (dropping the port comments), and convert the port comments into `overlay.json`.
@@ -58,7 +60,53 @@ For a fixed host port, declare mappings in `overlay.json`:
 }
 ```
 
-Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. Fixed mappings take effect at the **next launch** and collide if another running container claims the same host port. `overlay.json` is excluded from the image hash, so **changing ports or services never triggers a rebuild** — ports only change the `-p` flags on the next `docker run`; services apply live.
+Each entry is passed straight to `docker run -p`, so any value docker accepts works: `host:container`, `ip:host:container`, a bare container port, or a `/udp` suffix. Fixed mappings take effect at the **next launch** and collide if another running container claims the same host port. `overlay.json` (like `startup.sh`) is excluded from the image hash, so **changing ports or services never triggers a rebuild** — ports only change the `-p` flags on the next `docker run`; services apply live.
+
+## Runtime flags
+
+Some failures aren't missing software — they're missing container privileges. A VPN client can't create a TUN interface, a flasher can't see a USB device, a daemon needs a sysctl, a tool needs a token that only exists on the host. Those are `docker run` concerns, so they go in `overlay.json`, not the Dockerfile:
+
+```json
+{
+  "capabilities": ["NET_ADMIN"],
+  "devices": ["/dev/net/tun", "/dev/bus/usb:/dev/bus/usb:rwm"],
+  "sysctls": {"net.ipv4.ip_forward": 1},
+  "env": ["TS_AUTHKEY", "TS_HOSTNAME=worker-1"]
+}
+```
+
+| Key | Becomes | Accepts |
+| --- | --- | --- |
+| `capabilities` | `--cap-add` | Capability names, with or without `CAP_`. `ALL` is refused. |
+| `devices` | `--device` | `host[:container[:perms]]`; both paths must be under `/dev/`. |
+| `sysctls` | `--sysctl` | Container-namespaced only: `net.*`, `fs.mqueue.*`, `kernel.msg*`, `kernel.sem`, `kernel.shm*`. |
+| `env` | `-e` | Bare `NAME` forwards the host value; `NAME=value` sets a literal. |
+
+This is an **allowlist**, not a passthrough. `-v`, `--privileged`, `--pid=host` and `--network=host` cannot be expressed, by design — `overlay.json` is committed with the repo and applied silently at the next launch, so it must not be able to reach the host. Don't try to work around it; if a project genuinely needs one of those, tell the user and let them decide.
+
+Entries that don't validate are skipped with a warning and the launch continues — so if a flag seems to have no effect, read the launcher's output at startup.
+
+**Secrets go in the bare `"NAME"` form.** The value is read from the environment that ran `claude-container` and never lands in the container's argv. Never write a token into `overlay.json` as `"NAME=<token>"` — the file is committed. If the variable isn't set on the host, the launcher warns and the container simply doesn't get it; tell the user what to export.
+
+Like ports, these take effect at the **next launch** and never trigger a rebuild.
+
+## Startup hook
+
+`startup.sh` runs once per container start, immediately before Claude. Use it only for state that can't survive in an image layer — a daemon that must be running, a network to join, a socket to seed:
+
+```bash
+# .claude-container-overlay/startup.sh
+set -e
+sudo tailscaled --state=/var/lib/tailscale/tailscaled.state --tun=tailscale0 &
+sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$(hostname)"
+```
+
+- It runs **to completion**, not backgrounded, so an unattended agent starts with the setup already done. Background the long-lived daemon *inside* the script (as above); don't let the script itself block forever.
+- It runs as the **mapped non-root user**. For root, use `sudo` — which the overlay `Dockerfile` must install and grant (see the `apt-install` skill's sudo block for the drop-in).
+- A hook that fails or exceeds the timeout (120s, `CLAUDE_STARTUP_TIMEOUT` to change) warns and lets the session continue. Don't rely on it to gate anything critical without checking the result.
+- Installing the software still belongs in the `Dockerfile`. The hook only *starts* things.
+
+Everything the hook needs from the host — auth keys, tokens — comes through `overlay.json`'s `env`.
 
 ## When to add a Dockerfile entry
 
@@ -151,11 +199,12 @@ COPY pip.conf /etc/pip.conf
 
 When `claude-container` starts in a workspace containing `.claude-container-overlay/`:
 
-1. Reads port mappings from `overlay.json` (runtime-only; never affects the image).
-2. Hashes the base image tag + `Dockerfile` + any other files in the directory (excluding `overlay.json` and `skills/`).
+1. Reads port mappings and runtime flags from `overlay.json` (runtime-only; never affects the image).
+2. Hashes the base image tag + `Dockerfile` + any other files in the directory (excluding `overlay.json`, `startup.sh` and `skills/`).
 3. Looks for a local image tagged `claude-container-overlay:<hash>`.
 4. If it exists, uses it. If not, builds it: `FROM <base-image>` followed by the fragment, with the overlay directory as build context.
-5. Runs the container as usual against that image, adding the `-p` flags plus a single ephemeral publish of the service mux (which backs named services).
+5. Runs the container as usual against that image, adding the `-p` flags, the validated runtime flags, plus a single ephemeral publish of the service mux (which backs named services).
+6. Runs `startup.sh`, if present, before handing off to Claude.
 
 Because the tag is content-addressed, switching branches that have different overlays just switches images — no rebuild needed if you've used that overlay before.
 
