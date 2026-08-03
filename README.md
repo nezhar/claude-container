@@ -350,7 +350,11 @@ claude-container project on the machine, through three tiers:
    Yes/no answers are sticky, stored per project under
    `~/.config/claude-container/skill-choices/`; skip asks again next launch.
    Non-interactive launches never prompt — undecided skills just stay undeployed
-   until an interactive launch (or `--skills-accept`) decides them.
+   until an interactive launch (or `--skills-accept`) decides them. Pass
+   `--skills-ignore-new` to launch immediately with only what's already been
+   accepted, leaving any new skills undecided for a later launch. A linked git
+   worktree shares its main checkout's choices, so you decide about each skill
+   once per repo rather than once per worktree.
 
 At every launch the effective set — workspace skills plus accepted user-wide
 skills — is synced into the config dir's `skills/` directory. A manifest file
@@ -371,6 +375,7 @@ Manage everything with:
 | `claude-container --skills-reject <name>` | Exclude a user-wide skill from this project (sticky) |
 | `claude-container --skills-reset` | Forget this project's choices (prompts again next launch) |
 | `claude-container --skills-drop <name>` | Remove a skill from the user-wide set |
+| `claude-container --skills-ignore-new` | Launch without prompting; use only already-accepted skills |
 
 ### Running Inside tmux
 
@@ -457,6 +462,8 @@ This approach keeps Claude Code separate from your main application services whi
 Running `claude-container` inside a [linked git worktree](https://git-scm.com/docs/git-worktree) just works. A worktree's `.git` is a pointer file into the main checkout's `.git` directory, which lives outside the workspace — so mounting the worktree alone would leave git in the container with a dangling pointer (`fatal: not a git repository`). The launcher detects this and additionally bind-mounts the main repository's `.git` directory at the path the pointer expects inside the container.
 
 This pairs naturally with named services: run one container per worktree and they share the main repository's `.git` exactly as concurrent worktrees do on the host, while their services stay separately addressable per instance.
+
+Worktrees also inherit the main checkout's [skill choices](#skill-proposals-and-sharing): the per-project accept/reject decisions are keyed on the main working tree, so you decide about a user-wide skill once for the repo rather than again in every worktree.
 
 ## API Request Logging Proxy
 

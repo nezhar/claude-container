@@ -210,6 +210,58 @@ assert_contains "legacy overlay built" "$OUT" "Building overlay image"
 assert_contains "legacy fragment fed to build" "$(cat "$TMP/dockerfile-fed")" "RUN echo legacy-step"
 
 
+echo "== worktrees inherit the main checkout's skill choices =="
+if command -v git >/dev/null 2>&1; then
+    write_skill "$USER_SKILLS" wt-skill
+    MAIN="$TMP/wtmain"
+    mkdir -p "$MAIN"
+    git -C "$MAIN" init -q
+    git -C "$MAIN" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+    WT="$TMP/wtlinked"
+    git -C "$MAIN" worktree add -q "$WT" -b feature >/dev/null 2>&1
+
+    # Accept the skill from the MAIN checkout, then launch the worktree: it must
+    # reuse the same choices file (no re-prompt) and deploy the accepted skill.
+    launch "$MAIN" --skills-accept wt-skill >/dev/null
+    MAIN_CONF="$(printf '%s' "$CHOICES"/wtmain-*.conf)"
+    assert_exists "main checkout choices file written" "$MAIN_CONF"
+
+    OUT="$(launch "$WT")"
+    assert_contains "worktree deploys the inherited skill" "$OUT" "Skills deployed for this project"
+    assert_exists "no separate worktree choices file" "$MAIN_CONF"
+    # The worktree must NOT have minted its own basename-keyed choices file.
+    if compgen -G "$CHOICES/wtlinked-*.conf" >/dev/null; then
+        fail "worktree created its own choices file instead of inheriting"
+    else
+        pass "worktree shares the main checkout's choices file"
+    fi
+
+    # A reject from the worktree flows back to the shared file the main sees.
+    launch "$WT" --skills-reject wt-skill >/dev/null
+    assert_contains "worktree reject lands in shared file" "$(cat "$MAIN_CONF")" "wt-skill=reject"
+    OUT="$(launch "$MAIN")"
+    assert_not_contains "main honors the worktree's reject" "$OUT" "Skills deployed"
+
+    launch "$MAIN" --skills-drop wt-skill >/dev/null
+    rm -f "$CHOICES"/wtmain-*.conf
+else
+    echo "  skip: git not installed; worktree inheritance test not run"
+fi
+
+
+echo "== --skills-ignore-new (non-interactive smoke) =="
+# An undecided user-wide skill must not be deployed and must not record a choice
+# when launching with --skills-ignore-new; the container still starts.
+write_skill "$USER_SKILLS" ignore-me
+WS_IGN="$TMP/wsign"
+mkdir -p "$WS_IGN"
+OUT="$(launch "$WS_IGN" --skills-ignore-new)"
+assert_contains "flag accepted, container launches" "$OUT" "DOCKER-RUN: run"
+assert_not_contains "undecided skill not deployed" "$OUT" "Skills deployed"
+assert_missing "no choices file for an undecided skill" "$(printf '%s' "$CHOICES"/wsign-*.conf)"
+launch "$WS_IGN" --skills-drop ignore-me >/dev/null
+
+
 echo "== interactive prompt (sticky per-project choice) =="
 if command -v expect >/dev/null 2>&1; then
     WS4="$TMP/ws4"
@@ -234,6 +286,23 @@ spawn env PATH=$TMP/bin:\$env(PATH) HOME=$HOME bash $LAUNCHER -w $WS4
 expect eof
 " 2>&1)"
     assert_not_contains "no re-prompt once decided" "$OUT" "Include it in this project?"
+
+    # --skills-ignore-new must not prompt even on a tty, and must not record a
+    # choice for the undecided skill (WS5 has never decided about shared-skill).
+    WS5="$TMP/ws5"
+    mkdir -p "$WS5"
+    OUT="$(expect -c "
+set timeout 20
+spawn env PATH=$TMP/bin:\$env(PATH) HOME=$HOME bash $LAUNCHER -w $WS5 --skills-ignore-new
+expect eof
+" 2>&1)"
+    assert_not_contains "--skills-ignore-new suppresses the prompt on a tty" "$OUT" "Include it in this project?"
+    assert_contains "--skills-ignore-new still launches" "$OUT" "DOCKER-RUN: run"
+    if compgen -G "$CHOICES/ws5-*.conf" >/dev/null; then
+        fail "--skills-ignore-new recorded a choice for an undecided skill"
+    else
+        pass "--skills-ignore-new leaves undecided skills undecided"
+    fi
 else
     echo "  skip: expect not installed; prompt tests not run"
 fi

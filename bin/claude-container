@@ -68,6 +68,9 @@ SKILL_CHOICES_DIR="$CONFIG_BASE_DIR/skill-choices"
 BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills container-services"
 SKILLS_ACTION=""
 SKILLS_NAME=""
+# --skills-ignore-new: launch without prompting about undecided user-wide skills
+# (use whatever has already been accepted; leave new ones undecided for later).
+SKILLS_IGNORE_NEW=false
 # Named services: every container publishes a single in-container mux (svc-mux,
 # fixed container port below) on an EPHEMERAL host port, so any number of
 # concurrent containers — e.g. one per git worktree — never collide on host
@@ -140,6 +143,8 @@ SKILLS OPTIONS:
     --skills-reject <name>      Exclude a user-wide skill from this project (sticky)
     --skills-reset              Forget this project's choices (prompt again next launch)
     --skills-drop <name>        Remove a skill from the user-wide set
+    --skills-ignore-new         Launch without prompting about undecided skills
+                                (use only what's already accepted; decide later)
 
 EXAMPLES:
     claude-container                                # Run Claude (permission prompts disabled) in current dir
@@ -230,7 +235,8 @@ SKILL SHARING:
     project is prompted once at launch to accept or reject it, and the answer is
     sticky (stored under ~/.config/claude-container/skill-choices). Use --skills
     to review, and --skills-accept/--skills-reject/--skills-reset to manage a
-    project's choices.
+    project's choices. A linked git worktree inherits its main checkout's
+    choices, so you decide about each skill once per repo, not once per worktree.
 
 NAMED SERVICES:
     Fixed "ports" mappings collide when several containers run at once (e.g.
@@ -320,8 +326,10 @@ PY
 #   2. User-wide skills    $USER_SKILLS_DIR/<name>/
 #      Adopted from a workspace with --skills-adopt; offered to every project.
 #   3. Per-project choices  $SKILL_CHOICES_DIR/<project-key>.conf
-#      Records accept/reject per user-wide skill, per workspace. An undecided
+#      Records accept/reject per user-wide skill, per project. An undecided
 #      skill prompts once at launch; y/n answers are sticky, skip asks again.
+#      A linked git worktree keys off its MAIN working tree (skill_identity_dir),
+#      so all worktrees of a repo share one set of choices.
 #
 # Before each run the effective set (workspace skills + accepted user-wide
 # skills) is synced into $CONFIG_DIR/skills. A manifest file records which
@@ -337,15 +345,54 @@ sha256_12() {
     fi
 }
 
-# Stable per-workspace identity for the choices file: readable basename + path hash.
+# Stable per-directory identity: readable basename + path hash. Defaults to the
+# workspace; callers pass an explicit dir when they want a different identity
+# (skill choices key off the main worktree — see skill_identity_dir).
 project_key() {
-    local hash
-    hash=$(printf '%s' "$WORKSPACE_DIR" | sha256_12)
-    printf '%s-%s\n' "$(basename "$WORKSPACE_DIR" | tr -c 'a-zA-Z0-9_.-' '-' | sed 's/-*$//')" "$hash"
+    local dir="${1:-$WORKSPACE_DIR}" hash
+    hash=$(printf '%s' "$dir" | sha256_12)
+    printf '%s-%s\n' "$(basename "$dir" | tr -c 'a-zA-Z0-9_.-' '-' | sed 's/-*$//')" "$hash"
+}
+
+# The directory whose identity keys this project's skill choices. For a linked
+# git worktree that is the MAIN working tree, so every worktree of a repo shares
+# one set of accept/reject choices (decide about a skill once, not once per
+# worktree). Regular repos — and submodules, which are their own projects (their
+# gitdir has no commondir file) — key off the workspace itself. Cached in
+# SKILL_IDENTITY_DIR; WORKSPACE_DIR is already finalized before any caller runs.
+skill_identity_dir() {
+    local gitfile pointer host_gitdir commonrel host_common
+    gitfile="$WORKSPACE_DIR/.git"
+    if [ -f "$gitfile" ]; then
+        pointer=$(sed -n 's/^gitdir:[[:space:]]*//p' "$gitfile" | head -1)
+        case "$pointer" in
+            /*) host_gitdir="$pointer" ;;
+            "") host_gitdir="" ;;
+            *)  host_gitdir="$WORKSPACE_DIR/$pointer" ;;
+        esac
+        if [ -n "$host_gitdir" ] && host_gitdir="$(cd "$host_gitdir" 2>/dev/null && pwd)" \
+           && [ -f "$host_gitdir/commondir" ]; then
+            commonrel="$(head -1 "$host_gitdir/commondir")"
+            case "$commonrel" in
+                /*) host_common="$commonrel" ;;
+                *)  host_common="$host_gitdir/$commonrel" ;;
+            esac
+            # host_common is the main repo's git common dir (…/.git); its parent
+            # is the main working tree.
+            if host_common="$(cd "$host_common" 2>/dev/null && pwd)"; then
+                printf '%s\n' "$(dirname "$host_common")"
+                return 0
+            fi
+        fi
+    fi
+    printf '%s\n' "$WORKSPACE_DIR"
 }
 
 choices_file() {
-    printf '%s/%s.conf\n' "$SKILL_CHOICES_DIR" "$(project_key)"
+    if [ -z "${SKILL_IDENTITY_DIR:-}" ]; then
+        SKILL_IDENTITY_DIR="$(skill_identity_dir)"
+    fi
+    printf '%s/%s.conf\n' "$SKILL_CHOICES_DIR" "$(project_key "$SKILL_IDENTITY_DIR")"
 }
 
 valid_skill_name() {
@@ -397,7 +444,7 @@ set_skill_choice() {
     file="$(choices_file)"
     mkdir -p "$SKILL_CHOICES_DIR"
     if [ ! -f "$file" ]; then
-        printf '# claude-container per-project skill choices\n# workspace: %s\n' "$WORKSPACE_DIR" > "$file"
+        printf '# claude-container per-project skill choices\n# workspace: %s\n' "${SKILL_IDENTITY_DIR:-$WORKSPACE_DIR}" > "$file"
     fi
     tmp="$file.tmp"
     grep -v "^$name=" "$file" > "$tmp" || true
@@ -409,7 +456,7 @@ set_skill_choice() {
 # y/n answers are sticky (stored in the choices file); skip asks again next time.
 prompt_undecided_skills() {
     local name choice desc answer
-    if [ ! -t 0 ] || [ ! -t 1 ]; then
+    if [ "$SKILLS_IGNORE_NEW" = true ] || [ ! -t 0 ] || [ ! -t 1 ]; then
         return 0
     fi
     for name in $(list_skill_dirs "$USER_SKILLS_DIR"); do
@@ -1107,6 +1154,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skills-reset)
             SKILLS_ACTION="reset"
+            shift
+            ;;
+        --skills-ignore-new)
+            SKILLS_IGNORE_NEW=true
             shift
             ;;
         --pull)
