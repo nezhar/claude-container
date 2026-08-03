@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""Host-side service router for claude-container named-service forwarding.
+
+Each running container publishes a single in-container mux (svc-mux) on an
+ephemeral host port and registers itself under
+~/.config/claude-container/services/<instance>.json. Multiple worktrees can
+therefore run containers concurrently with zero port collisions. This daemon
+gives the tunneled services stable names:
+
+  HTTP front door (default 127.0.0.1:8484)
+      http://<service>.<instance>.claude.localhost:8484/   zero DNS setup —
+          browsers resolve *.localhost to 127.0.0.1 themselves
+      http://<service>.<instance>.claude:8484/             via the DNS server
+      http://127.0.0.1:8484/<instance>/<service>/...       path form (single
+          requests; sets X-Forwarded-Prefix, forces Connection: close)
+      http://127.0.0.1:8484/                               index of everything
+
+  DNS server (default 127.0.0.1:8453/udp)
+      answers A -> 127.0.0.1 for *.claude (see README for /etc/resolver and
+      systemd-resolved wiring)
+
+  Raw TCP (non-HTTP protocols)
+      claude-container --service-port <instance>/<service> prints a host port
+      that pipes straight to that service (allocated on demand, stable for the
+      router's lifetime, re-resolves the container's mux on every connection so
+      it survives container restarts).
+
+Routing is name-based all the way down: the router only knows instance ->
+mux port; the in-container mux resolves service -> local port from the
+workspace's overlay.json live, so services declared mid-session work with no
+restart of anything.
+
+Subcommands: run (foreground), ensure (start daemonized if not running), stop,
+status, port <instance>/<service>, services.
+"""
+
+import json
+import os
+import re
+import signal
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+CONFIG_BASE = os.environ.get(
+    "CLAUDE_CONTAINER_CONFIG_BASE",
+    os.path.expanduser("~/.config/claude-container"),
+)
+SERVICES_DIR = os.path.join(CONFIG_BASE, "services")
+PID_FILE = os.path.join(CONFIG_BASE, "router.pid")
+LOG_FILE = os.path.join(CONFIG_BASE, "router.log")
+
+BIND = os.environ.get("CLAUDE_ROUTER_BIND", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("CLAUDE_ROUTER_HTTP_PORT", "8484"))
+# Extra ports to serve the same HTTP front door on, best-effort. Port 80 makes
+# service URLs portless (http://<svc>.<inst>.claude.localhost/) — binding it
+# works unprivileged on macOS (>= 10.14) and on Linux after
+# `sysctl net.ipv4.ip_unprivileged_port_start=80`; when the bind fails the
+# router just runs without it.
+ALT_PORTS = [
+    int(p)
+    for p in os.environ.get("CLAUDE_ROUTER_HTTP_ALT_PORTS", "80").split(",")
+    if p.strip().isdigit()
+]
+DNS_PORT = int(os.environ.get("CLAUDE_ROUTER_DNS_PORT", "8453"))
+DOMAIN = os.environ.get("CLAUDE_ROUTER_DOMAIN", "claude").strip(".").lower()
+
+# HTTP ports actually listening, maintained by cmd_run; index/status prefer the
+# portless form when 80 is among them.
+bound_http_ports = [HTTP_PORT]
+
+
+def service_url(service, instance, suffix="localhost"):
+    host = f"{service}.{instance}.{DOMAIN}" + (f".{suffix}" if suffix else "")
+    if 80 in bound_http_ports:
+        return f"http://{host}/"
+    return f"http://{host}:{HTTP_PORT}/"
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+HEAD_LIMIT = 65536
+
+
+def canonical_instance(name):
+    """Mirror the launcher's instance-name sanitization (workspace basename,
+    lowercased, non-[a-z0-9-] chars becoming hyphens) so users can type the
+    directory name verbatim: led_mapper resolves to instance led-mapper."""
+    return re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
+
+
+def log(msg):
+    print(f"[router] {msg}", flush=True)
+
+
+# --- Registry -----------------------------------------------------------------
+
+
+def read_registry():
+    """{instance: {"workspace": ..., "mux_port": ..., ...}} from SERVICES_DIR."""
+    out = {}
+    if not os.path.isdir(SERVICES_DIR):
+        return out
+    for fn in sorted(os.listdir(SERVICES_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SERVICES_DIR, fn)) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("mux_port"), int):
+                out[data.get("name", fn[:-5])] = data
+        except Exception:
+            continue
+    return out
+
+
+def instance_services(entry):
+    """Declared services of an instance, read from its workspace overlay.json.
+
+    Values are normalized to {"port": int|None, "tls": bool} — overlay.json
+    accepts either a bare port or the extended {"port": N, "tls": true} form
+    (tls marks a service the router should link via a raw forward with an
+    https:// URL, since name-based HTTP routing can't carry TLS).
+    """
+    path = os.path.join(
+        entry.get("workspace", ""), ".claude-container-overlay", "overlay.json"
+    )
+    out = {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        services = data.get("services", {})
+        if not isinstance(services, dict):
+            return out
+        for k, v in services.items():
+            if not (isinstance(k, str) and NAME_RE.match(k)):
+                continue
+            tls = False
+            port = v
+            if isinstance(v, dict):
+                tls = bool(v.get("tls"))
+                port = v.get("port")
+            if isinstance(port, str) and port.isdigit():
+                port = int(port)
+            out[k] = {"port": port if isinstance(port, int) else None, "tls": tls}
+    except Exception:
+        pass
+    return out
+
+
+def dial_mux(instance, service):
+    """Connect through an instance's mux to a named service.
+
+    Returns the connected socket; raises RuntimeError with a message suitable
+    for a 502 body.
+    """
+    registry = read_registry()
+    entry = registry.get(instance) or registry.get(canonical_instance(instance))
+    if entry is None:
+        known = ", ".join(sorted(registry)) or "(none)"
+        raise RuntimeError(f"unknown instance '{instance}' (running: {known})")
+    try:
+        sock = socket.create_connection(("127.0.0.1", entry["mux_port"]), timeout=10)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot reach container mux for '{instance}': {exc} — the container "
+            "is likely running an image without svc-mux; re-run ./install.sh and "
+            "relaunch that claude-container session"
+        )
+    try:
+        sock.sendall(service.encode("ascii") + b"\n")
+        line = b""
+        while not line.endswith(b"\n") and len(line) < 512:
+            b_ = sock.recv(1)
+            if not b_:
+                break
+            line += b_
+        reply = line.decode("ascii", "replace").strip()
+        if not reply.startswith("OK"):
+            if reply.startswith("ERR "):
+                raise RuntimeError(reply[4:])
+            # Empty reply: docker accepted the published port but nothing
+            # answered inside — the usual sign of a container whose image
+            # predates svc-mux.
+            raise RuntimeError(
+                reply
+                or f"container mux for '{instance}' closed the connection — the "
+                "container is likely running an image without svc-mux; re-run "
+                "./install.sh and relaunch that claude-container session"
+            )
+    except (OSError, RuntimeError):
+        sock.close()
+        raise
+    sock.settimeout(None)
+    return sock
+
+
+# --- Byte splicing ------------------------------------------------------------
+
+
+def splice(a, b):
+    try:
+        while True:
+            data = a.recv(65536)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def splice_both(a, b):
+    t = threading.Thread(target=splice, args=(b, a), daemon=True)
+    t.start()
+    splice(a, b)
+    t.join()
+
+
+# --- Raw TCP forwarders (claude-container --service-port) ---------------------
+
+_forwarders = {}  # (instance, service) -> port
+_forwarders_lock = threading.Lock()
+
+
+class _ForwardHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            upstream = dial_mux(self.server.cc_instance, self.server.cc_service)
+        except RuntimeError as exc:
+            log(f"tcp-forward {self.server.cc_instance}/{self.server.cc_service}: {exc}")
+            return
+        try:
+            splice_both(self.request, upstream)
+        finally:
+            upstream.close()
+
+
+class _ThreadingTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def ensure_forwarder(instance, service):
+    """Host port that pipes raw TCP to instance/service, allocating if needed."""
+    with _forwarders_lock:
+        key = (instance, service)
+        if key in _forwarders:
+            return _forwarders[key]
+        server = _ThreadingTCPServer((BIND, 0), _ForwardHandler)
+        server.cc_instance = instance
+        server.cc_service = service
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _forwarders[key] = port
+        log(f"tcp-forward {instance}/{service} on {BIND}:{port}")
+        return port
+
+
+# --- HTTP front door ----------------------------------------------------------
+
+
+def http_response(status, body, content_type="text/plain; charset=utf-8"):
+    payload = body.encode() if isinstance(body, str) else body
+    head = (
+        f"HTTP/1.1 {status}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        f"Connection: close\r\n\r\n"
+    )
+    return head.encode() + payload
+
+
+def parse_head(raw):
+    """(method, path, version, [(name, value)]) from raw header bytes."""
+    text = raw.decode("iso-8859-1")
+    lines = text.split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) != 3:
+        raise ValueError("malformed request line")
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        headers.append((name.strip(), value.strip()))
+    return parts[0], parts[1], parts[2], headers
+
+
+def header_get(headers, name):
+    for k, v in headers:
+        if k.lower() == name.lower():
+            return v
+    return None
+
+
+def route_from_host(host):
+    """(instance, service) if the Host header names a service, else None."""
+    if not host:
+        return None
+    host = host.split(":")[0].lower().rstrip(".")
+    for suffix in (f".{DOMAIN}.localhost", f".{DOMAIN}"):
+        if host.endswith(suffix):
+            base = host[: -len(suffix)]
+            bits = base.split(".")
+            if len(bits) == 2 and all(NAME_RE.match(b) for b in bits):
+                return bits[1], bits[0]  # <service>.<instance>
+    return None
+
+
+def index_page():
+    registry = read_registry()
+    rows = []
+    for instance in sorted(registry):
+        entry = registry[instance]
+        services = instance_services(entry)
+        if not services:
+            rows.append(
+                f"<tr><td>{instance}</td><td colspan=3><i>no services declared "
+                f"in {entry.get('workspace', '?')}/.claude-container-overlay/overlay.json</i></td></tr>"
+            )
+        for svc in sorted(services):
+            if services[svc]["tls"]:
+                # TLS can't ride the name-based HTTP routing; allocate the raw
+                # forward here so the link is one click (self-signed cert
+                # warning still applies).
+                fwd = ensure_forwarder(instance, svc)
+                url = f"https://127.0.0.1:{fwd}/"
+                rows.append(
+                    f"<tr><td>{instance}</td><td>{svc}</td>"
+                    f"<td><a href='{url}'>{url}</a></td>"
+                    f"<td>TLS, via raw forward — expect a self-signed cert warning</td></tr>"
+                )
+                continue
+            url = service_url(svc, instance)
+            rows.append(
+                f"<tr><td>{instance}</td><td>{svc}</td>"
+                f"<td><a href='{url}'>{url}</a></td>"
+                f"<td><a href='/{instance}/{svc}/'>/{instance}/{svc}/</a></td></tr>"
+            )
+    body = (
+        "<!doctype html><title>claude-container services</title>"
+        "<style>body{font-family:sans-serif;margin:2em}td,th{padding:.3em .8em;"
+        "text-align:left;border-bottom:1px solid #ddd}</style>"
+        "<h1>claude-container services</h1>"
+        "<table><tr><th>instance</th><th>service</th><th>open</th>"
+        "<th>alt</th></tr>" + "".join(rows) + "</table>"
+        + ("<p><i>No containers registered.</i></p>" if not registry else "")
+        + f"<p>Raw TCP: <code>claude-container --service-port &lt;instance&gt;/&lt;service&gt;</code>"
+        f" &middot; DNS for <code>*.{DOMAIN}</code> on {BIND}:{DNS_PORT}/udp</p>"
+    )
+    return http_response("200 OK", body, "text/html; charset=utf-8")
+
+
+def handle_api(client, path):
+    if path == "/.cc/health":
+        client.sendall(http_response(
+            "200 OK",
+            json.dumps({"ok": True, "http_ports": bound_http_ports}),
+            "application/json",
+        ))
+        return
+    if path == "/.cc/services":
+        registry = read_registry()
+        out = [
+            {**entry, "services": instance_services(entry)}
+            for entry in registry.values()
+        ]
+        client.sendall(http_response("200 OK", json.dumps(out, indent=2), "application/json"))
+        return
+    m = re.match(r"^/\.cc/port/([^/]+)/([^/]+)$", path)
+    if m and NAME_RE.match(m.group(1)) and NAME_RE.match(m.group(2)):
+        instance, service = m.group(1), m.group(2)
+        # Fail unknown instances at allocation time (a bare port number gives
+        # the user nothing to debug when connections die later), and normalize
+        # the spelling so the forwarder key is canonical.
+        registry = read_registry()
+        if instance not in registry:
+            instance = canonical_instance(instance)
+        entry = registry.get(instance)
+        if entry is None:
+            known = ", ".join(sorted(registry)) or "(none)"
+            client.sendall(http_response(
+                "404 Not Found",
+                json.dumps({"error": f"unknown instance '{m.group(1)}' (running: {known})"}),
+                "application/json",
+            ))
+            return
+        port = ensure_forwarder(instance, service)
+        client.sendall(http_response(
+            "200 OK",
+            json.dumps({
+                "port": port,
+                "instance": instance,
+                "declared": service in instance_services(entry),
+                "declared_services": sorted(instance_services(entry)),
+            }),
+            "application/json",
+        ))
+        return
+    client.sendall(http_response("404 Not Found", "unknown API path\n"))
+
+
+class HTTPHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        # Listeners created via the wildcard-bind fallback (see cmd_run) are
+        # semantically loopback-only: drop any connection from off-machine.
+        if getattr(self.server, "cc_loopback_only", False):
+            peer = self.client_address[0]
+            if peer != "::1" and not peer.startswith("127."):
+                return
+        client = self.request
+        client.settimeout(30)
+        raw = b""
+        try:
+            while b"\r\n\r\n" not in raw:
+                chunk = client.recv(8192)
+                if not chunk:
+                    return
+                raw += chunk
+                if len(raw) > HEAD_LIMIT:
+                    client.sendall(http_response("431 Request Header Fields Too Large", ""))
+                    return
+        except OSError:
+            return
+        head, _, leftover = raw.partition(b"\r\n\r\n")
+        try:
+            method, path, version, headers = parse_head(head)
+        except ValueError:
+            client.sendall(http_response("400 Bad Request", "malformed request\n"))
+            return
+        client.settimeout(None)
+
+        if path.startswith("/.cc/"):
+            handle_api(client, path.split("?")[0])
+            return
+
+        host_route = route_from_host(header_get(headers, "Host"))
+        if host_route:
+            instance, service = host_route
+            self.forward(client, instance, service, head + b"\r\n\r\n" + leftover)
+            return
+
+        m = re.match(r"^/([^/?]+)/([^/?]+)(/[^?]*)?(\?.*)?$", path)
+        if m and NAME_RE.match(m.group(1)) and NAME_RE.match(m.group(2)):
+            instance, service = m.group(1), m.group(2)
+            new_path = (m.group(3) or "/") + (m.group(4) or "")
+            # Rebuild the head: rewritten request line, original headers minus
+            # Connection (forced to close — later requests on a kept-alive
+            # connection would still carry the /instance/service prefix).
+            lines = [f"{method} {new_path} {version}"]
+            for k, v in headers:
+                if k.lower() != "connection":
+                    lines.append(f"{k}: {v}")
+            lines.append("Connection: close")
+            lines.append(f"X-Forwarded-Prefix: /{instance}/{service}")
+            new_head = "\r\n".join(lines).encode("iso-8859-1") + b"\r\n\r\n"
+            self.forward(client, instance, service, new_head + leftover)
+            return
+
+        if path.split("?")[0] == "/":
+            client.sendall(index_page())
+        else:
+            client.sendall(http_response(
+                "404 Not Found",
+                "No route. Use http://<service>.<instance>."
+                f"{DOMAIN}.localhost:{HTTP_PORT}/ or /<instance>/<service>/ — "
+                f"index at http://{BIND}:{HTTP_PORT}/\n",
+            ))
+
+    def forward(self, client, instance, service, head_bytes):
+        try:
+            upstream = dial_mux(instance, service)
+        except RuntimeError as exc:
+            client.sendall(http_response("502 Bad Gateway", f"{exc}\n"))
+            return
+        try:
+            upstream.sendall(head_bytes)
+            splice_both(client, upstream)
+        except OSError:
+            pass
+        finally:
+            upstream.close()
+
+
+# --- DNS server ---------------------------------------------------------------
+
+
+def parse_qname(data, offset):
+    labels = []
+    while True:
+        length = data[offset]
+        if length == 0:
+            return ".".join(labels), offset + 1
+        if length > 63:
+            raise ValueError("compressed qname in question")
+        offset += 1
+        labels.append(data[offset : offset + length].decode("ascii", "replace"))
+        offset += length
+
+
+def dns_reply(query):
+    if len(query) < 12:
+        return None
+    tid, flags, qdcount = struct.unpack("!HHH", query[:6])
+    if qdcount != 1 or (flags & 0x8000):
+        return None
+    try:
+        qname, end = parse_qname(query, 12)
+        qtype, qclass = struct.unpack("!HH", query[end : end + 4])
+    except (ValueError, struct.error, IndexError):
+        return None
+    question = query[12 : end + 4]
+    name = qname.lower().rstrip(".")
+    matches = name == DOMAIN or name.endswith("." + DOMAIN)
+    if not matches:
+        rcode = 3  # NXDOMAIN
+        answers, ancount = b"", 0
+    elif qtype in (1, 255):  # A / ANY
+        rcode = 0
+        answers = struct.pack("!HHHLH4B", 0xC00C, 1, 1, 60, 4, 127, 0, 0, 1)
+        ancount = 1
+    else:
+        rcode = 0  # NOERROR, empty (e.g. AAAA) so clients fall back to A
+        answers, ancount = b"", 0
+    header = struct.pack(
+        "!HHHHHH", tid, 0x8580 | rcode, 1, ancount, 0, 0
+    )  # QR|AA|RD|RA
+    return header + question + answers
+
+
+def serve_dns(sock):
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except OSError:
+            return
+        reply = dns_reply(data)
+        if reply:
+            try:
+                sock.sendto(reply, addr)
+            except OSError:
+                pass
+
+
+# --- Daemon lifecycle ---------------------------------------------------------
+
+
+def health_ok(timeout=0.5):
+    try:
+        with urllib.request.urlopen(
+            f"http://{BIND}:{HTTP_PORT}/.cc/health", timeout=timeout
+        ) as resp:
+            return json.load(resp).get("ok") is True
+    except Exception:
+        return False
+
+
+def sync_bound_ports():
+    """CLI subcommands run outside the daemon — adopt its actual HTTP ports so
+    printed URLs match reality (portless when the daemon holds port 80)."""
+    global bound_http_ports
+    try:
+        with urllib.request.urlopen(
+            f"http://{BIND}:{HTTP_PORT}/.cc/health", timeout=0.5
+        ) as resp:
+            ports = json.load(resp).get("http_ports")
+            if isinstance(ports, list) and all(isinstance(p, int) for p in ports):
+                bound_http_ports = ports
+    except Exception:
+        pass
+
+
+def cmd_run():
+    os.makedirs(CONFIG_BASE, exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    http_server = _ThreadingTCPServer((BIND, HTTP_PORT), HTTPHandler)
+    for alt in ALT_PORTS:
+        if alt == HTTP_PORT:
+            continue
+        try:
+            alt_server = _ThreadingTCPServer((BIND, alt), HTTPHandler)
+        except PermissionError as exc:
+            # macOS allows unprivileged low-port binds on the WILDCARD address
+            # only, not on 127.0.0.1 specifically. Fall back to a wildcard
+            # listener whose handler drops non-loopback peers, so portless
+            # URLs work without exposing the front door to the LAN.
+            alt_server = None
+            if sys.platform == "darwin" and BIND == "127.0.0.1":
+                try:
+                    alt_server = _ThreadingTCPServer(("0.0.0.0", alt), HTTPHandler)
+                    alt_server.cc_loopback_only = True
+                except OSError as exc2:
+                    exc = exc2
+            if alt_server is None:
+                hint = ""
+                if alt == 80 and sys.platform.startswith("linux"):
+                    hint = " (enable with: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80)"
+                log(f"HTTP alt port {BIND}:{alt} unavailable: {exc}{hint}; URLs need :{HTTP_PORT}")
+                continue
+        except OSError as exc:
+            hint = ""
+            if alt == 80 and sys.platform.startswith("linux"):
+                hint = " (enable with: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80)"
+            log(f"HTTP alt port {BIND}:{alt} unavailable: {exc}{hint}; URLs need :{HTTP_PORT}")
+            continue
+        threading.Thread(target=alt_server.serve_forever, daemon=True).start()
+        bound_http_ports.append(alt)
+        if alt == 80:
+            extra = " (wildcard bind, loopback-only enforced)" if getattr(alt_server, "cc_loopback_only", False) else ""
+            log(f"port 80 bound{extra} — portless URLs work: http://<service>.<instance>.{DOMAIN}.localhost/")
+    dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        dns_sock.bind((BIND, DNS_PORT))
+        threading.Thread(target=serve_dns, args=(dns_sock,), daemon=True).start()
+        log(f"DNS for *.{DOMAIN} on {BIND}:{DNS_PORT}/udp")
+    except OSError as exc:
+        log(f"DNS disabled ({BIND}:{DNS_PORT}: {exc}); *.{DOMAIN}.localhost names still work")
+    log(f"HTTP front door on http://{BIND}:{HTTP_PORT}/ (domain: {DOMAIN})")
+
+    def shutdown(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    try:
+        http_server.serve_forever()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+
+def cmd_ensure(quiet=False):
+    if health_ok():
+        if not quiet:
+            print(f"router already running on http://{BIND}:{HTTP_PORT}/")
+        return 0
+    os.makedirs(CONFIG_BASE, exist_ok=True)
+    logf = open(LOG_FILE, "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "run"],
+        stdout=logf,
+        stderr=logf,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(40):
+        if health_ok():
+            if not quiet:
+                print(f"router started on http://{BIND}:{HTTP_PORT}/ (log: {LOG_FILE})")
+            return 0
+        time.sleep(0.25)
+    print(f"error: router did not come up; see {LOG_FILE}", file=sys.stderr)
+    return 1
+
+
+def cmd_stop():
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        if health_ok():
+            print(f"error: router is running but {PID_FILE} is missing", file=sys.stderr)
+            return 1
+        print("router is not running")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for _ in range(20):
+        if not health_ok(timeout=0.2):
+            break
+        time.sleep(0.1)
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    print("router stopped")
+    return 0
+
+
+def cmd_status():
+    if not health_ok():
+        print("router: not running")
+        print(f"  start with: claude-container --router-start   (log: {LOG_FILE})")
+        return 1
+    sync_bound_ports()
+    ports = ",".join(str(p) for p in bound_http_ports)
+    print(f"router: running — http://{BIND}:{HTTP_PORT}/  http ports {ports}  dns {BIND}:{DNS_PORT}/udp  domain .{DOMAIN}")
+    return cmd_services()
+
+
+def fetch_forward_port(instance, service):
+    """Ask the running daemon for a raw-forward port (allocating if needed)."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{BIND}:{HTTP_PORT}/.cc/port/{instance}/{service}", timeout=2
+        ) as resp:
+            port = json.load(resp).get("port")
+            return port if isinstance(port, int) else None
+    except Exception:
+        return None
+
+
+def cmd_services():
+    sync_bound_ports()
+    registry = read_registry()
+    if not registry:
+        print("no containers registered")
+        return 0
+    router_up = health_ok()
+    for instance in sorted(registry):
+        entry = registry[instance]
+        services = instance_services(entry)
+        print(f"{instance}  ({entry.get('workspace', '?')}, mux :{entry['mux_port']})")
+        if not services:
+            print("    no services declared in overlay.json")
+        for svc in sorted(services):
+            if services[svc]["tls"]:
+                fwd = fetch_forward_port(instance, svc) if router_up else None
+                if fwd:
+                    print(f"    {svc:<20} https://127.0.0.1:{fwd}/  (tls, raw forward)")
+                else:
+                    print(
+                        f"    {svc:<20} tls — claude-container --service-port {instance}/{svc}"
+                    )
+                continue
+            print(f"    {svc:<20} {service_url(svc, instance)}")
+    return 0
+
+
+def cmd_port(spec):
+    m = re.match(r"^([^/]+)/([^/]+)$", spec)
+    if not m or not NAME_RE.match(m.group(1)) or not NAME_RE.match(m.group(2)):
+        print(f"error: expected <instance>/<service>, got '{spec}'", file=sys.stderr)
+        return 1
+    if not health_ok() and cmd_ensure(quiet=True) != 0:
+        return 1
+    try:
+        with urllib.request.urlopen(
+            f"http://{BIND}:{HTTP_PORT}/.cc/port/{m.group(1)}/{m.group(2)}", timeout=5
+        ) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            msg = json.load(exc).get("error", str(exc))
+        except Exception:
+            msg = str(exc)
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"error: could not allocate forward: {exc}", file=sys.stderr)
+        return 1
+    print(data["port"])
+    if not data.get("declared", True):
+        declared = ", ".join(data.get("declared_services", [])) or "(none)"
+        print(
+            f"note: '{m.group(2)}' is not currently declared in "
+            f"{data.get('instance', m.group(1))}'s overlay.json "
+            f"(declared: {declared}); the forward will work once it is.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__.strip().splitlines()[0])
+        print("usage: claude-container-router run|ensure|stop|status|services|port <instance>/<service>")
+        return 2
+    cmd = args[0]
+    if cmd == "run":
+        cmd_run()
+        return 0
+    if cmd == "ensure":
+        return cmd_ensure()
+    if cmd == "stop":
+        return cmd_stop()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "services":
+        return cmd_services()
+    if cmd == "port" and len(args) == 2:
+        return cmd_port(args[1])
+    print(f"error: unknown command '{' '.join(args)}'", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

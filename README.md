@@ -183,25 +183,108 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ```
 
 **`overlay.json`** holds structured runtime configuration — data the launcher
-reads at `docker run` time rather than baking into the image. Currently that is
-port forwarding (for a dev server, web UI, debugger, etc.):
+reads at `docker run` time rather than baking into the image: fixed port
+forwarding and named services (see the next section for the latter):
 
 ```json
 {
-  "ports": ["8080:8080", "127.0.0.1:3000:3000", "9000:9000/udp"]
+  "ports": ["8080:8080", "127.0.0.1:3000:3000", "9000:9000/udp"],
+  "services": {"dashboard": 8099}
 }
 ```
 
-Each entry is passed straight to `docker run -p`, so any value Docker accepts
-works (`host:container`, `ip:host:container`, a bare container port, or a `/udp`
-suffix). `overlay.json` and `skills/` are excluded from the image hash, so
-changing ports or skills never triggers a rebuild.
+Each `ports` entry is passed straight to `docker run -p`, so any value Docker
+accepts works (`host:container`, `ip:host:container`, a bare container port, or
+a `/udp` suffix). `overlay.json` and `skills/` are excluded from the image hash,
+so changing ports, services, or skills never triggers a rebuild.
 
 **Legacy form:** a single `.claude-container-overlay` *file* (a Dockerfile
 fragment with `# claude-container:port <mapping>` directive comments) is still
 supported, but the directory form is preferred — the launcher prints a migration
 hint when it sees one, and the bundled `container-overlay` skill teaches Claude
 to migrate it.
+
+### Named Services
+
+Fixed `"ports"` mappings collide as soon as two containers want the same host
+port — the moment you run one container per git worktree, they stomp on each
+other. Named services solve this: each container publishes exactly **one**
+in-container mux (`svc-mux`, baked into the image) on an **ephemeral** host
+port, and any number of in-container services are tunneled through it by name.
+Declare them in `overlay.json`:
+
+```json
+{ "services": {"dashboard": 8099, "api": 8080, "web-tls": {"port": 8443, "tls": true}} }
+```
+
+A bare number declares a plain-HTTP service; the extended `{"port": N,
+"tls": true}` form marks a TLS server. TLS can't ride the name-based HTTP
+routing, so for those the dashboard and `--services` instead render a
+clickable `https://127.0.0.1:<port>/` link through an automatically allocated
+raw TCP forward (expect the self-signed-certificate warning; the port is
+stable while the router runs).
+
+A small host-side daemon, `claude-container-router` (started automatically at
+launch), gives every instance's services stable names:
+
+| Access | Form |
+|---|---|
+| Browser, zero setup | `http://dashboard.myrepo.claude.localhost/` |
+| Browser, via the DNS server | `http://dashboard.myrepo.claude/` |
+| Path form | `http://127.0.0.1:8484/myrepo/dashboard/...` |
+| Index of everything | `http://127.0.0.1:8484/` |
+| Raw TCP (non-HTTP) | `claude-container --service-port myrepo/dashboard` → prints a host port |
+
+The portless forms work because the router binds port 80 in addition to its
+primary port (8484) whenever it can: out of the box on macOS (unprivileged
+low-port binds are allowed since 10.14 — but only on the wildcard address, so
+the router falls back to a wildcard listener that drops non-loopback peers)
+and on Linux after `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80`
+(persist it in `/etc/sysctl.d/` to survive reboots). If port 80 is unavailable — e.g. a local
+nginx owns it — the router logs a note and everything works with `:8484`
+appended; `claude-container --services` always prints the exact working URLs.
+HTTPS is not terminated (that would need a locally trusted CA à la `mkcert`);
+plain `http://` on loopback is a secure context in browsers anyway.
+
+The instance name is the workspace directory's basename (`myrepo` above; a
+short path hash is appended only when two different workspaces share a
+basename). The launcher prints it at startup, and `claude-container --services`
+lists all running instances and their services.
+
+Because each container's mux resolves service names by re-reading its
+workspace's `overlay.json` **on every connection**, Claude can build a new
+dashboard mid-session, add one line to `overlay.json`, and hand you a working
+URL — no container restart, no launcher restart, no port hunting. The
+`*.localhost` host form needs no DNS setup at all (browsers and systemd
+resolve `*.localhost` to `127.0.0.1` themselves).
+
+The router also runs a tiny DNS server (default `127.0.0.1:8453/udp`) that
+answers `A → 127.0.0.1` for `*.claude`, for the shorter host form:
+
+- **macOS** — create `/etc/resolver/claude` containing:
+
+  ```
+  nameserver 127.0.0.1
+  port 8453
+  ```
+
+- **Linux (systemd-resolved)** — resolved can't query a non-53 port; either run
+  the router's DNS on port 53 (`CLAUDE_ROUTER_DNS_PORT=53`, needs
+  root/`CAP_NET_BIND_SERVICE`, then `resolvectl dns lo 127.0.0.1` +
+  `resolvectl domain lo '~claude'`), or point a local dnsmasq at it
+  (`server=/claude/127.0.0.1#8453`). Or just use the `*.claude.localhost`
+  form, which needs nothing.
+
+Router management: `--router-start`, `--router-stop`, `--router-status`,
+`--router-logs`. Configuration via environment variables:
+`CLAUDE_ROUTER_HTTP_PORT` (default 8484), `CLAUDE_ROUTER_HTTP_ALT_PORTS`
+(best-effort extra listeners, default `80`), `CLAUDE_ROUTER_DNS_PORT` (8453),
+`CLAUDE_ROUTER_DOMAIN` (`claude`), `CLAUDE_ROUTER_BIND` (`127.0.0.1`). State
+lives in `~/.config/claude-container/` (`services/` registrations,
+`router.log`, `router.pid`). Everything binds to loopback only.
+
+When to still use `"ports"`: something outside the machine must reach in on a
+well-known port, a config hardcodes a port number, or the protocol is UDP.
 
 ### Permissions
 
@@ -230,6 +313,9 @@ container-specific features in **every** workspace, with no per-project setup:
 
 - **`container-overlay`** — how to persist tooling and declare port mappings via
   the `.claude-container-overlay/` directory.
+- **`container-services`** — how to expose in-container servers as named
+  services (and migrate old `"ports"` entries to them; see Named Services
+  above).
 - **`container-tmux`** — how to drive the tmux session when running with `--tmux`
   (see below).
 - **`container-skills`** — how to propose new skills from inside the container

@@ -65,9 +65,24 @@ USER_SKILLS_DIR="$CONFIG_BASE_DIR/user-skills"
 SKILL_CHOICES_DIR="$CONFIG_BASE_DIR/skill-choices"
 # Names reserved by the image's baked-in skills (the entrypoint re-deploys these
 # on every container start, so managed skills must not collide with them).
-BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills"
+BUNDLED_SKILL_NAMES="container-overlay container-tmux container-skills container-services"
 SKILLS_ACTION=""
 SKILLS_NAME=""
+# Named services: every container publishes a single in-container mux (svc-mux,
+# fixed container port below) on an EPHEMERAL host port, so any number of
+# concurrent containers — e.g. one per git worktree — never collide on host
+# ports. Launches register {instance, workspace, mux port} in SERVICES_DIR; the
+# claude-container-router daemon reads it to give services stable names
+# (http://<service>.<instance>.claude.localhost:8484/) and raw TCP forwards
+# (--service-port). Service name -> container port lives in overlay.json's
+# "services" object, resolved live inside the container, so services declared
+# mid-session need no restart.
+SERVICES_DIR="$CONFIG_BASE_DIR/services"
+MUX_CONTAINER_PORT=7999
+ROUTER_ACTION=""
+SERVICE_PORT_SPEC=""
+SERVICE_INSTANCE=""
+CC_CONTAINER_NAME=""
 
 # Color codes for output
 RED='\033[0;31m'
@@ -108,6 +123,15 @@ DATASETTE OPTIONS:
     --datasette-port <port>     Set Datasette port (default: 8001)
     --datasette-stop            Stop and cleanup Datasette container
     --datasette-logs            Show Datasette container logs
+
+SERVICE OPTIONS:
+    --services                  List running instances and their named services
+    --service-port <inst>/<svc> Print a host port that pipes raw TCP to a named
+                                service (allocated on demand, non-HTTP protocols)
+    --router-start              Start the host service router (DNS + HTTP)
+    --router-stop               Stop the host service router
+    --router-status             Show router status and registered services
+    --router-logs               Tail the router log
 
 SKILLS OPTIONS:
     --skills                    List user-wide + workspace skills and this project's choices
@@ -165,9 +189,10 @@ WORKSPACE OVERLAY:
         │                   overlay directory is the build context, so COPY
         │                   of files in it works). Use this to persist tools
         │                   like apt packages, Nix, or global CLIs.
-        ├── overlay.json    Structured runtime config. Currently supported:
-        │                   {"ports": ["8080:8080", "127.0.0.1:3000:3000"]}
-        │                   Each entry is passed straight to "docker run -p".
+        ├── overlay.json    Structured runtime config:
+        │                   {"ports": ["8080:8080"], "services": {"web": 8099}}
+        │                   "ports" entries go straight to "docker run -p";
+        │                   "services" declares NAMED services (see below).
         └── skills/<name>/  Skills proposed by Claude from inside the container
                             (deployed at launch, never baked into the image).
 
@@ -181,10 +206,10 @@ WORKSPACE OVERLAY:
 
 BUNDLED SKILLS:
     The image ships with Claude Code skills baked in (container-overlay,
-    container-tmux, container-skills). They are deployed into the skills
-    directory automatically on container start, so Claude knows how to use the
-    overlay, tmux, and skill-sharing features in every workspace — no
-    per-project setup required.
+    container-tmux, container-skills, container-services). They are deployed
+    into the skills directory automatically on container start, so Claude knows
+    how to use the overlay, tmux, skill-sharing, and named-service features in
+    every workspace — no per-project setup required.
 
 SKILL SHARING:
     Claude can propose new skills from inside the container by writing them to
@@ -198,6 +223,32 @@ SKILL SHARING:
     sticky (stored under ~/.config/claude-container/skill-choices). Use --skills
     to review, and --skills-accept/--skills-reject/--skills-reset to manage a
     project's choices.
+
+NAMED SERVICES:
+    Fixed "ports" mappings collide when several containers run at once (e.g.
+    one per git worktree). Named services avoid that: declare
+    {"services": {"dashboard": 8099}} in overlay.json and each container
+    publishes only a single mux on an EPHEMERAL host port. The
+    claude-container-router daemon (started automatically at launch) then
+    serves every instance's services by name:
+
+        http://<service>.<instance>.claude.localhost/        (no DNS setup)
+        http://<service>.<instance>.claude/                  (via its DNS server)
+        http://127.0.0.1:8484/<instance>/<service>/...       (path form)
+        http://127.0.0.1:8484/                               (index of everything)
+        claude-container --service-port <instance>/<service> (raw TCP port)
+
+    Portless URLs need the router to hold port 80: automatic on macOS; on
+    Linux run 'sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80' first.
+    Otherwise append :8484 — --services always prints the working URLs.
+
+    <instance> is the workspace directory's basename (suffixed with a short
+    hash on collisions) — see --services for the live list. Service names are
+    resolved inside the container on every connection, so Claude can declare a
+    new service in overlay.json mid-session and it is immediately reachable,
+    no restarts. The DNS server (default 127.0.0.1:8453/udp, domain .claude)
+    is optional sugar; see the README for /etc/resolver and systemd-resolved
+    wiring.
 
 TMUX SESSION (--tmux):
     With --tmux, Claude runs inside a tmux session named "claude" and the host's
@@ -613,6 +664,126 @@ skills_reset() {
     return 0
 }
 
+# --- Named services -----------------------------------------------------------
+#
+# See the SERVICES_DIR comment at the top of the file for the architecture.
+# The launcher's part: name the container, publish the in-container mux on an
+# ephemeral host port, register the instance for the router once the port is
+# known, and deregister on exit.
+
+# Locate the router script: prefer the copy installed next to this launcher.
+router_bin() {
+    local dir src
+    src="${BASH_SOURCE[0]}"
+    dir="$(cd "$(dirname "$src")" && pwd)"
+    if [ -x "$dir/claude-container-router" ]; then
+        printf '%s\n' "$dir/claude-container-router"
+    elif command -v claude-container-router >/dev/null 2>&1; then
+        command -v claude-container-router
+    fi
+    return 0
+}
+
+registry_field() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2" 2>/dev/null
+    return 0
+}
+
+# Instance name for URLs: the workspace basename, plus a short path hash only
+# when a different workspace already registered the plain name.
+service_instance_name() {
+    local base name ws
+    base=$(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-*//; s/-*$//')
+    [ -n "$base" ] || base="workspace"
+    name="$base"
+    if [ -f "$SERVICES_DIR/$name.json" ]; then
+        ws="$(registry_field "$SERVICES_DIR/$name.json" workspace)"
+        if [ -n "$ws" ] && [ "$ws" != "$WORKSPACE_DIR" ]; then
+            name="$base-$(printf '%s' "$WORKSPACE_DIR" | sha256_12 | cut -c1-6)"
+        fi
+    fi
+    printf '%s\n' "$name"
+}
+
+# Register this launch in the background: wait for docker to assign the mux's
+# ephemeral host port, prune registrations whose containers are gone, write the
+# registry entry, and make sure the router is up. Best-effort throughout — a
+# missing python3 or router never blocks the launch.
+register_services_async() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "$SERVICES_DIR"
+    (
+        mux_port=""
+        for _ in $(seq 1 60); do
+            mux_port=$(docker port "$CC_CONTAINER_NAME" "${MUX_CONTAINER_PORT}/tcp" 2>/dev/null | head -1)
+            mux_port="${mux_port##*:}"
+            if [ -n "$mux_port" ]; then
+                break
+            fi
+            sleep 0.5
+        done
+        if [ -z "$mux_port" ]; then
+            exit 0
+        fi
+        running=$(docker ps --format '{{.Names}}')
+        for reg in "$SERVICES_DIR"/*.json; do
+            [ -f "$reg" ] || continue
+            c="$(registry_field "$reg" container)"
+            if [ -n "$c" ] && ! printf '%s\n' "$running" | grep -qx "$c"; then
+                rm -f "$reg"
+            fi
+        done
+        CC_REG_FILE="$SERVICES_DIR/$SERVICE_INSTANCE.json" \
+        CC_REG_NAME="$SERVICE_INSTANCE" \
+        CC_REG_WS="$WORKSPACE_DIR" \
+        CC_REG_CONTAINER="$CC_CONTAINER_NAME" \
+        CC_REG_PORT="$mux_port" \
+        python3 - <<'PY'
+import json, os, time
+path = os.environ["CC_REG_FILE"]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({
+        "name": os.environ["CC_REG_NAME"],
+        "workspace": os.environ["CC_REG_WS"],
+        "container": os.environ["CC_REG_CONTAINER"],
+        "mux_port": int(os.environ["CC_REG_PORT"]),
+        "started": int(time.time()),
+    }, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+        rb="$(router_bin)"
+        if [ -n "$rb" ]; then
+            CLAUDE_CONTAINER_CONFIG_BASE="$CONFIG_BASE_DIR" "$rb" ensure >/dev/null 2>&1 || true
+        fi
+    ) &
+    REGISTER_PID=$!
+    return 0
+}
+
+# Remove this launch's registry entry (only if it is still ours — a newer
+# launch from the same workspace may have overwritten it). Stops the background
+# registration first so a container that exited immediately doesn't get
+# registered after the fact; the launch-time prune is the backstop for any
+# entry that slips through.
+deregister_services() {
+    if [ -n "${REGISTER_PID:-}" ]; then
+        kill "$REGISTER_PID" 2>/dev/null || true
+        wait "$REGISTER_PID" 2>/dev/null || true
+    fi
+    local reg="$SERVICES_DIR/$SERVICE_INSTANCE.json"
+    if [ -z "$SERVICE_INSTANCE" ] || [ ! -f "$reg" ]; then
+        return 0
+    fi
+    if [ "$(registry_field "$reg" container)" = "$CC_CONTAINER_NAME" ]; then
+        rm -f "$reg"
+    fi
+    return 0
+}
+
 # Function to stop datasette
 stop_datasette() {
     if docker ps -a --format '{{.Names}}' | grep -q "^${DATASETTE_CONTAINER_NAME}$"; then
@@ -734,6 +905,7 @@ start_datasette() {
 # Function to cleanup on exit
 cleanup() {
     local exit_code=$?
+    deregister_services
     if [ $exit_code -ne 0 ] && [ "$USE_PROXY" = true ]; then
         echo -e "\n${YELLOW}Error occurred. Cleaning up...${NC}"
         stop_proxy
@@ -797,6 +969,35 @@ while [[ $# -gt 0 ]]; do
             ;;
         --datasette-logs)
             SHOW_DATASETTE_LOGS=true
+            shift
+            ;;
+        --services)
+            ROUTER_ACTION="services"
+            shift
+            ;;
+        --service-port)
+            if [ -z "${2:-}" ] || [[ "$2" == -* ]]; then
+                echo -e "${RED}Error: --service-port requires <instance>/<service>${NC}"
+                exit 1
+            fi
+            ROUTER_ACTION="port"
+            SERVICE_PORT_SPEC="$2"
+            shift 2
+            ;;
+        --router-start)
+            ROUTER_ACTION="start"
+            shift
+            ;;
+        --router-stop)
+            ROUTER_ACTION="stop"
+            shift
+            ;;
+        --router-status)
+            ROUTER_ACTION="status"
+            shift
+            ;;
+        --router-logs)
+            ROUTER_ACTION="logs"
             shift
             ;;
         --skills)
@@ -864,6 +1065,31 @@ PROXY_DATA_DIR="${CLAUDE_PROXY_DATA:-$PROXY_DATA_DIR}"
 IMAGE="${CLAUDE_IMAGE:-$IMAGE}"
 PROXY_IMAGE="${CLAUDE_PROXY_IMAGE:-$PROXY_IMAGE}"
 DATASETTE_IMAGE="${CLAUDE_DATASETTE_IMAGE:-$DATASETTE_IMAGE}"
+
+# Handle service router commands (host-side; no container involved).
+if [ -n "$ROUTER_ACTION" ]; then
+    ROUTER="$(router_bin)"
+    if [ -z "$ROUTER" ]; then
+        echo -e "${RED}Error: claude-container-router not found (expected next to this script or on PATH).${NC}"
+        echo -e "${YELLOW}Re-run ./install.sh from the repo checkout to install it.${NC}"
+        exit 1
+    fi
+    export CLAUDE_CONTAINER_CONFIG_BASE="$CONFIG_BASE_DIR"
+    case "$ROUTER_ACTION" in
+        start)    exec "$ROUTER" ensure ;;
+        stop)     exec "$ROUTER" stop ;;
+        status)   exec "$ROUTER" status ;;
+        services) exec "$ROUTER" services ;;
+        port)     exec "$ROUTER" port "$SERVICE_PORT_SPEC" ;;
+        logs)
+            if [ ! -f "$CONFIG_BASE_DIR/router.log" ]; then
+                echo -e "${RED}Error: no router log at $CONFIG_BASE_DIR/router.log${NC}"
+                exit 1
+            fi
+            exec tail -f "$CONFIG_BASE_DIR/router.log"
+            ;;
+    esac
+fi
 
 # Handle skill management commands (host-side; no container involved).
 if [ -n "$SKILLS_ACTION" ]; then
@@ -995,6 +1221,12 @@ CONFIG_DIR="$(cd "$CONFIG_DIR" && pwd)" 2>/dev/null || CONFIG_DIR="$(mkdir -p "$
 # Always disable Claude's permission prompts for this sandboxed container.
 ensure_bypass_permissions
 
+# Named-service identity for this launch: a stable, readable instance name (for
+# service URLs) and a unique container name (so concurrent launches — one per
+# worktree — can each be found with `docker port`).
+SERVICE_INSTANCE="$(service_instance_name)"
+CC_CONTAINER_NAME="cc-$(project_key)-$$"
+
 # Per-project skill deployment: prompt for any user-wide skills this project
 # hasn't decided on yet, sync the effective set (workspace + accepted user-wide)
 # into the config dir's skills directory, then point out workspace skills that
@@ -1094,6 +1326,35 @@ if [ ${#PORT_MAPPINGS[@]} -gt 0 ]; then
     echo -e "${GREEN}Publishing overlay ports:${NC} ${YELLOW}${PORT_MAPPINGS[*]}${NC}"
 fi
 
+# Named services declared in overlay.json (display only — resolution happens
+# live inside the container, so this list can grow mid-session).
+SERVICES_DECLARED=""
+if [ -f "$OVERLAY_PATH/overlay.json" ] && command -v python3 >/dev/null 2>&1; then
+    SERVICES_DECLARED=$(OVERLAY_JSON="$OVERLAY_PATH/overlay.json" python3 - <<'PY'
+import json, os
+try:
+    with open(os.environ["OVERLAY_JSON"]) as f:
+        services = json.load(f).get("services", {})
+    parts = []
+    if isinstance(services, dict):
+        for k, v in sorted(services.items()):
+            # Bare port, or extended {"port": N, "tls": true}.
+            if isinstance(v, dict):
+                parts.append(f"{k}:{v.get('port')}{'(tls)' if v.get('tls') else ''}")
+            else:
+                parts.append(f"{k}:{v}")
+    print(" ".join(parts))
+except Exception:
+    pass
+PY
+)
+fi
+if [ -n "$SERVICES_DECLARED" ]; then
+    echo -e "${GREEN}Named services:${NC} ${YELLOW}${SERVICES_DECLARED}${NC}"
+    ROUTER_HTTP_PORT="${CLAUDE_ROUTER_HTTP_PORT:-8484}"
+    echo -e "${GREEN}Reachable at:${NC} ${YELLOW}http://<service>.${SERVICE_INSTANCE}.claude.localhost/${NC} (append :${ROUTER_HTTP_PORT} if port 80 isn't bound; exact URLs: claude-container --services)"
+fi
+
 if [ -n "$OVERLAY_BUILD" ]; then
     # Hash base image + build inputs (runtime concerns excluded) -> tag. For
     # directory overlays the inputs also include any extra context files the
@@ -1187,8 +1448,12 @@ if [ "$USE_PROXY" = true ]; then
     fi
     echo ""
 
-    # Run the container with proxy
+    # Run the container with proxy. The svc-mux publish uses an EPHEMERAL host
+    # port (empty host part) so concurrent containers never collide; the
+    # background registration discovers the assigned port via `docker port`.
+    register_services_async
     docker run --rm -it \
+        --name "$CC_CONTAINER_NAME" \
         --network "$NETWORK_NAME" \
         -v "$WORKSPACE_DIR:/workspace" \
         -v "$CONFIG_DIR:/claude" \
@@ -1196,6 +1461,8 @@ if [ "$USE_PROXY" = true ]; then
         -e "ANTHROPIC_BASE_URL=http://$PROXY_CONTAINER_NAME:8080" \
         -e "USER_UID=$(id -u)" \
         -e "USER_GID=$(id -g)" \
+        -e "CLAUDE_SERVICE_INSTANCE=$SERVICE_INSTANCE" \
+        -p "127.0.0.1::${MUX_CONTAINER_PORT}" \
         "${PORT_ARGS[@]}" \
         "${EXTRA_DOCKER_ARGS[@]}" \
         "$IMAGE" \
@@ -1217,13 +1484,22 @@ else
     echo -e "Config:    ${YELLOW}$CONFIG_DIR${NC}"
     echo ""
 
-    # Run the container
+    # Deregister the instance when the launch ends (no proxy cleanup needed).
+    trap cleanup EXIT INT TERM
+
+    # Run the container. The svc-mux publish uses an EPHEMERAL host port (empty
+    # host part) so concurrent containers never collide; the background
+    # registration discovers the assigned port via `docker port`.
+    register_services_async
     docker run --rm -it \
+        --name "$CC_CONTAINER_NAME" \
         -v "$WORKSPACE_DIR:/workspace" \
         -v "$CONFIG_DIR:/claude" \
         -e "CLAUDE_CONFIG_DIR=/claude" \
         -e "USER_UID=$(id -u)" \
         -e "USER_GID=$(id -g)" \
+        -e "CLAUDE_SERVICE_INSTANCE=$SERVICE_INSTANCE" \
+        -p "127.0.0.1::${MUX_CONTAINER_PORT}" \
         "${PORT_ARGS[@]}" \
         "${EXTRA_DOCKER_ARGS[@]}" \
         "$IMAGE" \

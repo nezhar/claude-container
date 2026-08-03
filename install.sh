@@ -129,6 +129,11 @@ echo -e "${GREEN}Installing launcher to ${BIN_DIR}/claude-container${NC}"
 $SUDO mkdir -p "$BIN_DIR"
 $SUDO install -m 0755 "$REPO_DIR/bin/claude-container" "$BIN_DIR/claude-container"
 
+# The service router backs the launcher's named-service features (--services,
+# --service-port, --router-*); the launcher looks for it next to itself.
+echo -e "${GREEN}Installing service router to ${BIN_DIR}/claude-container-router${NC}"
+$SUDO install -m 0755 "$REPO_DIR/bin/claude-container-router" "$BIN_DIR/claude-container-router"
+
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *)

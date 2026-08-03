@@ -85,6 +85,13 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY claude-tmux /usr/local/bin/claude-tmux
 RUN chmod +x /usr/local/bin/claude-tmux
 
+# svc-mux: single-port tunnel for named services declared in the workspace
+# overlay's overlay.json. The launcher publishes it on an ephemeral host port
+# and the host-side claude-container-router routes to services through it by
+# name. Started in the background by the entrypoint.
+COPY svc-mux /usr/local/bin/svc-mux
+RUN chmod +x /usr/local/bin/svc-mux
+
 # Bundled Claude Code skills. Baked into the image here; the entrypoint deploys
 # them into the user's skills directory at startup so they're available in every
 # workspace without per-project provisioning.
