@@ -522,6 +522,14 @@ This pairs naturally with named services: run one container per worktree and the
 
 Worktrees also inherit the main checkout's [skill choices](#skill-proposals-and-sharing): the per-project accept/reject decisions are keyed on the main working tree, so you decide about a user-wide skill once for the repo rather than again in every worktree.
 
+The launcher only mounts the git dir for the workspace's own `.git` pointer — it does not scan for nested worktrees. If you place additional linked worktrees inside the workspace whose `.git` points (by absolute host path) at *other* repositories' git dirs, expose each of those with `--mount`:
+
+```bash
+claude-container -w ./my-worktree --mount /path/to/other-repo/.git
+```
+
+`--mount <path>` bind-mounts the host `<path>` at the **identical path** inside the container (repeatable). Because the path is preserved, an absolute `gitdir:`/`commondir` pointer resolves in the container exactly as it does on the host. Paths already inside the workspace are skipped (they are visible via `/workspace` already), and a path that does not exist on the host is warned about and ignored. Unlike the [overlay](#workspace-overlay)'s runtime flags — which are an allowlist so a committed/agent-written config can't reach arbitrary host paths — `--mount` is supplied by the caller per launch, so an arbitrary host path is intentional.
+
 ## API Request Logging Proxy
 
 This repository includes an optional logging proxy that captures all Anthropic API requests and responses to a SQLite database. This is useful for:

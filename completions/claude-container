@@ -35,12 +35,13 @@ _claude_container_completion() {
         --pull
         --shell
         --tmux
+        --mount
         --version -v
         --help -h
     "
 
     # Flags that expect a directory path
-    local dir_flags="--workspace -w --config -c --proxy-data"
+    local dir_flags="--workspace -w --config -c --proxy-data --mount"
 
     # Flags that expect a port number
     local port_flags="--datasette-port"
@@ -52,7 +53,7 @@ _claude_container_completion() {
     local action_flags="--proxy --proxy-stop --proxy-logs --datasette --datasette-only --datasette-stop --datasette-logs --skills --skills-reset --services --router-start --router-stop --router-status --router-logs --pull --shell --tmux --version -v --help -h"
 
     case "$prev" in
-        --workspace|-w|--config|-c|--proxy-data)
+        --workspace|-w|--config|-c|--proxy-data|--mount)
             # Complete with directories only
             _filedir -d
             return 0

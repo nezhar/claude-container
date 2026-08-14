@@ -13,6 +13,7 @@
 #   --proxy-data <path>     Set proxy data directory (default: ./proxy-data)
 #   --proxy-stop            Stop and cleanup proxy container
 #   --proxy-logs            Show proxy logs
+#   --mount <path>          Bind-mount host <path> at the same path in the container (repeatable)
 #   --help, -h              Show this help message
 #
 # Examples:
@@ -61,6 +62,12 @@ PORT_ARGS=()
 OVERLAY_RUNTIME_ARGS=()
 # Extra docker run args assembled at launch time (e.g. tmux mount + env)
 EXTRA_DOCKER_ARGS=()
+# Caller-requested same-path bind mounts (--mount <path>): each host <path> is
+# bound at the IDENTICAL path inside the container. Used to make sibling repos'
+# git common-dirs (referenced by absolute gitdir pointers in nested worktrees)
+# resolve unchanged. Unlike overlay.json these are supplied per-launch by the
+# caller, not committed with the repo, so an arbitrary host path is acceptable.
+MOUNT_SPECS=()
 # Skill sharing: agents inside the container propose skills into the workspace's
 # .claude-container-skills/; skills adopted user-wide live in USER_SKILLS_DIR and
 # are offered to every project; per-project accept/reject choices are sticky and
@@ -117,6 +124,10 @@ OPTIONS:
     --shell                     Drop into container shell instead of starting Claude
     --tmux                      Run Claude inside a named tmux session (mounts the
                                 host's ~/.tmux.conf) so you can open extra shells
+    --mount <path>              Bind-mount host <path> at the IDENTICAL path inside
+                                the container (repeatable). Useful so sibling/nested
+                                linked worktrees whose .git points at other repos'
+                                git dirs by absolute path resolve in the container.
 
 PROXY OPTIONS:
     --proxy                     Enable API logging proxy
@@ -163,6 +174,7 @@ EXAMPLES:
     claude-container --pull                         # Pull latest images and run
     claude-container --shell                        # Access container shell before starting Claude
     claude-container --tmux                         # Run Claude inside a tmux session
+    claude-container --mount /repos/other/.git      # Also expose another repo's git dir at the same path
     claude-container --skills                       # List skills and this project's choices
     claude-container --skills-adopt my-skill        # Share a workspace skill with all projects
     claude-container ls -la                         # Run custom command in container
@@ -830,6 +842,32 @@ PY
     return 0
 }
 
+# --- Extra same-path bind mounts (--mount) ------------------------------------
+#
+# Each --mount <path> binds the host <path> at the SAME absolute path inside the
+# container. This mirrors how setup_worktree_git_mount handles an absolute gitdir
+# pointer (target == host path), so nested/sibling linked worktrees whose .git
+# pointers reference OTHER repos' git common-dirs by absolute host path resolve
+# unchanged. Paths already inside the workspace mount are skipped (they are
+# visible via /workspace already).
+setup_extra_mounts() {
+    local spec resolved
+    for spec in "${MOUNT_SPECS[@]}"; do
+        if ! resolved="$(cd "$spec" 2>/dev/null && pwd)"; then
+            echo -e "${YELLOW}Warning: --mount path does not exist on the host, skipping:${NC} ${spec}"
+            continue
+        fi
+        case "$resolved" in
+            "$WORKSPACE_DIR"|"$WORKSPACE_DIR"/*)
+                echo -e "${YELLOW}--mount path is inside the workspace (already mounted), skipping:${NC} ${resolved}"
+                continue
+                ;;
+        esac
+        EXTRA_DOCKER_ARGS+=(-v "$resolved:$resolved")
+        echo -e "${GREEN}Extra bind mount (same path):${NC} ${YELLOW}$resolved${NC}"
+    done
+}
+
 # --- Named services -----------------------------------------------------------
 #
 # See the SERVICES_DIR comment at the top of the file for the architecture.
@@ -1199,6 +1237,14 @@ while [[ $# -gt 0 ]]; do
             TMUX_MODE=true
             shift
             ;;
+        --mount)
+            if [ -z "${2:-}" ] || [[ "$2" == -* ]]; then
+                echo -e "${RED}Error: --mount requires a host path${NC}"
+                exit 1
+            fi
+            MOUNT_SPECS+=("$2")
+            shift 2
+            ;;
         -v|--version)
             echo -e "${GREEN}Claude Container Version Information${NC}"
             echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1394,6 +1440,10 @@ ensure_bypass_permissions
 # Workspaces that are linked git worktrees (or submodules) need the main
 # repository's git dir mounted too — see setup_worktree_git_mount.
 setup_worktree_git_mount
+
+# Caller-requested same-path bind mounts (--mount). Runs after the worktree
+# mount so its skip-if-inside-workspace check sees the resolved WORKSPACE_DIR.
+setup_extra_mounts
 
 # Named-service identity for this launch: a stable, readable instance name (for
 # service URLs) and a unique container name (so concurrent launches — one per
